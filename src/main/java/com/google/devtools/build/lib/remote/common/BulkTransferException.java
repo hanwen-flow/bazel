@@ -15,8 +15,11 @@ package com.google.devtools.build.lib.remote.common;
 
 import static com.google.common.base.Preconditions.checkState;
 
-import com.google.common.base.Joiner;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * Exception which represents a collection of IOExceptions for the purpose of distinguishing remote
@@ -81,9 +84,26 @@ public class BulkTransferException extends IOException {
     if (super.getSuppressed().length == 1) {
       return super.getSuppressed()[0].getMessage();
     }
-    String errorSummary =
-        String.format("%d errors during bulk transfer:", super.getSuppressed().length);
-    String combinedSuberrors = Joiner.on('\n').join(super.getSuppressed());
-    return Joiner.on('\n').join(errorSummary, combinedSuberrors);
+    StringBuilder sb = new StringBuilder();
+    sb.append(String.format("%d errors during bulk transfer:\n", super.getSuppressed().length));
+
+    Set<String> seen = new HashSet<>();
+    for (var e : super.getSuppressed()) {
+      if (seen.contains(e.getMessage())) {
+        continue;
+      }
+      seen.add(e.getMessage());
+
+      try (StringWriter sw = new StringWriter();
+          PrintWriter pw = new PrintWriter(sw)) {
+        e.printStackTrace(pw);
+
+        sb.append(sw).append("\n\n");
+      } catch (IOException ex) {
+        throw new RuntimeException(ex);
+      }
+    }
+
+    return sb.toString();
   }
 }
