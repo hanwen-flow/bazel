@@ -22,6 +22,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.analysis.BlazeVersionInfo;
 import com.google.devtools.build.lib.authandtls.StaticCredentials;
+import com.google.devtools.build.lib.bazel.repository.cache.DownloadCache.KeyType;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.events.Event;
 import com.google.devtools.build.lib.events.EventHandler;
@@ -108,6 +109,9 @@ final class HttpConnectorMultiplexer {
     baseHeaders.putAll(headers);
     // REQUEST_HEADERS should not be overridable by user provided headers
     baseHeaders.putAll(REQUEST_HEADERS);
+    if (checksum.isPresent() && checksum.get().getKeyType() == KeyType.SHA256) {
+      baseHeaders.put("X-Bazel-Digest", ImmutableList.of(checksum.get().toString()));
+    }
 
     Function<URI, ImmutableMap<String, List<String>>> headerFunction =
         getHeaderFunction(baseHeaders.buildKeepingLast(), credentials, eventHandler);
