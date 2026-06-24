@@ -22,10 +22,17 @@
 // rootless CRIU can re-create exactly on restore; the (shared host) network
 // namespace keeps the server's gRPC port reachable from ordinary host clients.
 //
-// This module only ever STARTS servers in a namespace and RESTORES checkpoints.
-// Taking a checkpoint (criu dump) is still driven externally; see the horapha
-// tooling. Everything here is a no-op on non-Linux platforms and whenever
-// BAZEL_CRIU is unset, so the normal launcher behavior is unchanged.
+// Taking a checkpoint (criu dump) is driven from *inside* the namespace: the
+// persistent init serves a small control socket on $output_base, and when a
+// host-side launcher (invoked with BAZEL_CRIU_CHECKPOINT set) connects and asks
+// it to dump, the init runs `criu dump --unprivileged` against the server. criu
+// runs inside the user namespace it owns (where it holds CAP_CHECKPOINT_RESTORE
+// and sees a self-consistent mount namespace), which is what lets a rootless,
+// unprivileged dump succeed without root, without a chown, and without having
+// to special-case the host's inherited snap/squashfs/FUSE mounts.
+//
+// Everything here is a no-op on non-Linux platforms and whenever BAZEL_CRIU is
+// unset, so the normal launcher behavior is unchanged.
 
 #ifndef BAZEL_SRC_MAIN_CPP_BLAZE_CRIU_H_
 #define BAZEL_SRC_MAIN_CPP_BLAZE_CRIU_H_
@@ -48,6 +55,19 @@ namespace blaze {
 //   - auto-restores $output_base/criu/ before starting a fresh server;
 //   - drops the /proc starttime check in VerifyServerProcess.
 bool CriuModeActive();
+
+// Returns true if this invocation is a request to checkpoint the running
+// server rather than to run a normal bazel command, i.e. the
+// BAZEL_CRIU_CHECKPOINT environment variable is set (and we are on Linux). When
+// true, Main short-circuits into CriuCheckpoint instead of RunLauncher.
+bool CriuCheckpointRequested();
+
+// Asks the in-namespace init serving output_base's control socket to checkpoint
+// the running server into $output_base/criu/ (criu dump, rootless, from inside
+// the namespace). If BAZEL_CRIU_CHECKPOINT=stop, the server is also torn down
+// after the dump. Returns a process exit code (0 on success). Prints progress
+// and any error to stderr.
+int CriuCheckpoint(const blaze_util::Path &output_base);
 
 // Returns true if a usable CRIU checkpoint exists for output_base, i.e. the
 // images dir contains the recorded namespace-local pid that restore needs.
