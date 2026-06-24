@@ -39,18 +39,25 @@ constexpr char kCriuImagesSubdir[] = "criu";
 // without trusting bazel's mutable server.pid.txt. Matches horapha's
 // serverinfo.CheckpointPIDName.
 constexpr char kNsPidFile[] = "ns-pid";
-// Filesystem types CRIU should tolerate rather than refuse to dump/restore.
-// The server's mount namespace inherits the host's FUSE/squashfs/autofs mounts
-// (e.g. snap packages under /snap) locked from the outer user namespace, so we
-// cannot detach them; --enable-fs makes CRIU ignore them instead of failing
-// with "unsupported id". A build never touches these mounts. The matching flag
-// must be passed to the manual `criu dump` too (see CRIU.md).
-constexpr char kCriuEnableFs[] = "squashfs,fuse,autofs";
+// Control socket (relative to output_base) on which the in-namespace init
+// listens for checkpoint requests. It lives on the shared output_base mount so
+// a host-side launcher can reach it; the init is the only process that can run
+// criu, since CAP_CHECKPOINT_RESTORE is held only inside the user namespace.
+// Matches horapha's control.SockName.
+constexpr char kControlSockName[] = "bazel-criu.sock";
 }  // namespace
 
 bool CriuModeActive() {
 #ifdef __linux__
   return ExistsEnv("BAZEL_CRIU");
+#else
+  return false;
+#endif
+}
+
+bool CriuCheckpointRequested() {
+#ifdef __linux__
+  return ExistsEnv("BAZEL_CRIU_CHECKPOINT");
 #else
   return false;
 #endif
@@ -81,21 +88,34 @@ int ExecuteDaemonInNamespace(const blaze_util::Path &, const vector<string> &,
 
 bool CriuRestore(const blaze_util::Path &) { return false; }
 
+int CriuCheckpoint(const blaze_util::Path &) {
+  BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
+      << "BAZEL_CRIU is only supported on Linux.";
+  return -1;
+}
+
 }  // namespace blaze
 
 #else  // __linux__
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <sys/signalfd.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <chrono>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -276,15 +296,247 @@ vector<string> EnvToStrings(const map<string, EnvVarValue> &env) {
   return out;
 }
 
-// The body of the persistent PID-1 init. Never returns: it forks the
-// foreground command (argv/envp), waits for it, reports the foreground exit
-// code to the launcher over status_wfd, then keeps reaping the (daemonized or
-// restored) server tree until the namespace empties, so the namespace stays
-// alive for a later checkpoint. Runs in a freshly forked process and performs
-// no heap allocation (the argv/envp arrays are built by the caller before the
-// fork), using only fork/exec/wait/mount/open/write to stay fork-safe.
-[[noreturn]] void RunInit(char *const argv[], char *const envp[],
-                          int status_wfd) {
+// Plain-old-data view of the paths the persistent init needs to serve the
+// checkpoint control socket and run `criu dump` from inside the namespace. All
+// members point into std::strings owned by the caller's frame, which outlives
+// the two forks down to the init (fork copies the frame), so the init may read
+// them freely. `sock_path` empty means "do not serve a control socket".
+struct InitControl {
+  const char *sock_path;
+  const char *criu_bin;
+  const char *images_dir;
+  const char *ns_pid_file;
+  const char *server_pid_file;
+};
+
+// Reads a small unsigned decimal from `path` (e.g. server.pid.txt). Returns -1
+// on any error. Fork-safe: open/read/close + manual parse only.
+int ReadIntFromFile(const char *path) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  char buf[32];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    return -1;
+  }
+  int v = 0;
+  bool any = false;
+  for (ssize_t i = 0; i < n; i++) {
+    char c = buf[i];
+    if (c >= '0' && c <= '9') {
+      v = v * 10 + (c - '0');
+      any = true;
+    } else if (any) {
+      break;  // stop at first non-digit after the number (e.g. newline)
+    }
+  }
+  return any ? v : -1;
+}
+
+// Writes "<value>\n" to `path`, creating/truncating it. Fork-safe.
+bool WriteIntFile(const char *path, int value) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    ChildPerror(path);
+    return false;
+  }
+  char buf[32];
+  int len = snprintf(buf, sizeof(buf), "%d\n", value);
+  bool ok = len > 0 && write(fd, buf, len) == len;
+  close(fd);
+  return ok;
+}
+
+// Creates and binds the init's checkpoint control socket at `path`, returning a
+// listening fd or -1. The socket lives on the shared output_base mount, so a
+// host-side launcher (CriuCheckpoint) can connect even though it cannot enter
+// the namespace. Fork-safe: socket/bind/listen + a manual path copy.
+int MakeControlSocket(const char *path) {
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  if (strlen(path) >= sizeof(addr.sun_path)) {
+    // A pathologically long output_base; skip control serving rather than
+    // truncate to a wrong path. Checkpoints will be unavailable for this base.
+    ChildPerror("control socket path too long");
+    return -1;
+  }
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  // A stale socket inode from a previous init would make bind() fail.
+  unlink(path);
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    ChildPerror("control socket()");
+    return -1;
+  }
+  if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+    ChildPerror("control bind()");
+    close(fd);
+    return -1;
+  }
+  if (listen(fd, 8) != 0) {
+    ChildPerror("control listen()");
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+// Runs `criu dump` against the namespaced server, from inside the namespace
+// (where the init holds CAP_CHECKPOINT_RESTORE over its own user namespace and
+// criu sees a self-consistent mount view). This is what lets the dump succeed
+// rootless and unprivileged — and why it does not need the host-side
+// --enable-fs workaround for the inherited snap/squashfs mounts. The server's
+// namespace-local pid is read from server.pid.txt (pids are namespace-local in
+// here). On success the checkpointed ns pid is recorded next to the images so
+// restore can find the revived server. Fork-safe.
+bool RunCriuDump(const InitControl *ctl, bool leave_running) {
+  int ns_pid = ReadIntFromFile(ctl->server_pid_file);
+  if (ns_pid <= 0) {
+    ChildPerror("read server pid for dump");
+    return false;
+  }
+
+  mkdir(ctl->images_dir, 0755);  // ignore EEXIST
+
+  char tree[16];
+  snprintf(tree, sizeof(tree), "%d", ns_pid);
+  char logfile[4096];
+  snprintf(logfile, sizeof(logfile), "%s/dump.log", ctl->images_dir);
+
+  // Mirrors horapha's criu.Options{ShellJob, TCPClose, LeaveRunning,
+  // Unprivileged}. --unprivileged is the crux: criu treats the privileged
+  // net/mount state it cannot touch as non-fatal, which is exactly what an
+  // in-namespace rootless dump needs.
+  const char *argv[20];
+  int i = 0;
+  argv[i++] = ctl->criu_bin;
+  argv[i++] = "dump";
+  argv[i++] = "--tree";
+  argv[i++] = tree;
+  if (leave_running) {
+    argv[i++] = "--leave-running";
+  }
+  argv[i++] = "--images-dir";
+  argv[i++] = ctl->images_dir;
+  argv[i++] = "--ghost-limit";
+  argv[i++] = "1000000000";
+  argv[i++] = "--skip-file-rwx-check";
+  argv[i++] = "--shell-job";
+  argv[i++] = "--tcp-close";
+  // The bazel server holds flock()s (e.g. on its output base); dump and restore
+  // them rather than refusing. Within the namespace the lock holders are part
+  // of the dumped tree, so this is self-consistent.
+  argv[i++] = "--file-locks";
+  argv[i++] = "--unprivileged";
+  argv[i++] = "--log-file";
+  argv[i++] = logfile;
+  argv[i++] = "-v4";
+  argv[i] = nullptr;
+
+  pid_t p = fork();
+  if (p < 0) {
+    ChildPerror("fork criu dump");
+    return false;
+  }
+  if (p == 0) {
+    execvp(argv[0], const_cast<char *const *>(argv));
+    ChildPerror(argv[0]);
+    _exit(127);
+  }
+
+  // Wait specifically for criu, reaping any other children that exit meanwhile
+  // (transient server subprocesses); the server itself stays up (--leave-
+  // running). criu's own dump-helper children are reaped by criu, not us.
+  bool ok = false;
+  while (true) {
+    int status;
+    pid_t w = waitpid(-1, &status, 0);
+    if (w < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if (w == p) {
+      ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      break;
+    }
+  }
+  if (ok) {
+    // Record the checkpointed ns-local pid alongside the images so restore can
+    // locate the revived server without trusting bazel's mutable pid file.
+    WriteIntFile(ctl->ns_pid_file, ns_pid);
+  }
+  return ok;
+}
+
+// Handles one checkpoint-control connection. Reads a single command line and
+// replies "OK <msg>\n" / "ERR <msg>\n", mirroring horapha's control protocol.
+// Returns true if the init should now tear down the namespace (CHECKPOINT_STOP
+// after a successful dump). Fork-safe.
+bool HandleControlConn(const InitControl *ctl, int conn) {
+  char line[256];
+  size_t len = 0;
+  while (len < sizeof(line) - 1) {
+    char c;
+    ssize_t r = read(conn, &c, 1);
+    if (r <= 0) {
+      break;
+    }
+    if (c == '\n') {
+      break;
+    }
+    line[len++] = c;
+  }
+  // Trim trailing CR/whitespace.
+  while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ')) {
+    len--;
+  }
+  line[len] = '\0';
+
+  auto reply = [&](const char *msg) {
+    (void)!write(conn, msg, strlen(msg));
+  };
+
+  if (strcmp(line, "PING") == 0) {
+    reply("OK pong\n");
+    return false;
+  }
+  if (strcmp(line, "CHECKPOINT") == 0) {
+    bool ok = RunCriuDump(ctl, /*leave_running=*/true);
+    reply(ok ? "OK checkpointed\n"
+             : "ERR criu dump failed (see criu/dump.log)\n");
+    return false;
+  }
+  if (strcmp(line, "CHECKPOINT_STOP") == 0) {
+    // Dump with the server left running so we can reply before the namespace
+    // dies; criu killing PID 1 would otherwise race the response. After
+    // replying we tear the namespace down ourselves.
+    bool ok = RunCriuDump(ctl, /*leave_running=*/true);
+    if (!ok) {
+      reply("ERR criu dump failed (see criu/dump.log)\n");
+      return false;
+    }
+    reply("OK checkpointed and stopped\n");
+    return true;  // caller kills the tree and exits
+  }
+  reply("ERR unknown command\n");
+  return false;
+}
+
+// The body of the persistent PID-1 init. Never returns: it forks the foreground
+// command (argv/envp), reports its exit code to the launcher over status_wfd,
+// then runs an event loop that (a) reaps the daemonized/restored server tree
+// and (b) serves the checkpoint control socket, so a host-side CriuCheckpoint
+// can ask us — the only process holding CAP_CHECKPOINT_RESTORE over this user
+// namespace — to run `criu dump`. Stays fork-safe: only syscalls + stack
+// buffers, no heap, no BAZEL_LOG.
+[[noreturn]] void RunInit(char *const argv[], char *const envp[], int status_wfd,
+                          const InitControl *ctl) {
   // Drop every inherited fd except the status pipe — crucially the launcher's
   // output-base lock, which the persistent init and server would otherwise hold
   // forever, blocking all future clients. Do this first, before we fork the
@@ -301,6 +553,20 @@ vector<string> EnvToStrings(const map<string, EnvVarValue> &env) {
     _exit(1);
   }
 
+  // Block SIGCHLD and route it through a signalfd so the event loop below can
+  // poll() child exits and control-socket connections together. Both fds are
+  // CLOEXEC so they vanish from the exec'd foreground command. Set up before
+  // forking fg so no SIGCHLD from it is missed.
+  sigset_t chld_mask;
+  sigemptyset(&chld_mask);
+  sigaddset(&chld_mask, SIGCHLD);
+  sigprocmask(SIG_BLOCK, &chld_mask, nullptr);
+  int sfd = signalfd(-1, &chld_mask, SFD_NONBLOCK | SFD_CLOEXEC);
+
+  int lfd = (ctl != nullptr && ctl->sock_path[0] != '\0')
+                ? MakeControlSocket(ctl->sock_path)
+                : -1;
+
   pid_t fg = fork();
   if (fg < 0) {
     ChildPerror("fork foreground");
@@ -309,50 +575,103 @@ vector<string> EnvToStrings(const map<string, EnvVarValue> &env) {
     _exit(1);
   }
   if (fg == 0) {
-    // execvpe (not execve) so a bare command name like "criu" is resolved
-    // against PATH. The fresh-start path passes an absolute daemonize path,
-    // which execvpe handles too.
+    // Restore the default signal mask for the server (the sfd/lfd are CLOEXEC,
+    // so they close on exec). execvpe (not execve) resolves a bare "criu" via
+    // PATH; the fresh-start path passes an absolute daemonize path, fine too.
+    sigprocmask(SIG_UNBLOCK, &chld_mask, nullptr);
     execvpe(argv[0], argv, envp);
     ChildPerror(argv[0]);
     _exit(127);  // exec failed
   }
 
-  // Reaper loop. Record the foreground command's status when it is reaped,
-  // report it to the launcher, then keep reaping the remaining tree (the
-  // persisted server) until the namespace empties.
+  // Event loop: reap children (reporting fg's exit once) and serve checkpoint
+  // requests until the namespace empties or a CHECKPOINT_STOP tears it down.
   int fg_code = 1;
   bool reported = false;
-  while (true) {
-    int status;
-    pid_t w = waitpid(-1, &status, 0);
-    if (w < 0) {
+  bool stop = false;
+  while (!stop) {
+    struct pollfd pfds[2];
+    pfds[0].fd = sfd;
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    pfds[1].fd = lfd;  // negative fd is ignored by poll
+    pfds[1].events = POLLIN;
+    pfds[1].revents = 0;
+    int r = poll(pfds, 2, -1);
+    if (r < 0) {
       if (errno == EINTR) {
         continue;
       }
-      break;  // ECHILD: namespace is empty.
+      break;
     }
-    if (w == fg && !reported) {
-      fg_code = WaitStatusToCode(status);
-      char code = static_cast<char>(fg_code);
-      (void)!write(status_wfd, &code, 1);
-      close(status_wfd);
-      reported = true;
 
-      // Detach stdio so the launcher's shell sees EOF and the init runs quietly.
-      int devnull = open("/dev/null", O_RDWR);
-      if (devnull >= 0) {
-        dup2(devnull, 0);
-        dup2(devnull, 1);
-        dup2(devnull, 2);
-        if (devnull > 2) {
-          close(devnull);
+    if (pfds[0].revents & POLLIN) {
+      struct signalfd_siginfo si;
+      while (read(sfd, &si, sizeof(si)) == sizeof(si)) {
+      }  // drain coalesced SIGCHLDs
+      bool empty = false;
+      while (true) {
+        int status;
+        pid_t w = waitpid(-1, &status, WNOHANG);
+        if (w == 0) {
+          break;  // children remain but none ready
+        }
+        if (w < 0) {
+          if (errno == ECHILD) {
+            empty = true;  // namespace is empty
+          }
+          break;
+        }
+        if (w == fg && !reported) {
+          fg_code = WaitStatusToCode(status);
+          char code = static_cast<char>(fg_code);
+          (void)!write(status_wfd, &code, 1);
+          close(status_wfd);
+          reported = true;
+          // Detach stdio so the launcher's shell sees EOF and we run quietly.
+          int devnull = open("/dev/null", O_RDWR);
+          if (devnull >= 0) {
+            dup2(devnull, 0);
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            if (devnull > 2) {
+              close(devnull);
+            }
+          }
         }
       }
+      if (empty) {
+        break;
+      }
     }
+
+    if (lfd >= 0 && (pfds[1].revents & POLLIN)) {
+      int conn = accept4(lfd, nullptr, nullptr, SOCK_CLOEXEC);
+      if (conn >= 0) {
+        stop = HandleControlConn(ctl, conn);
+        close(conn);
+      }
+    }
+  }
+
+  if (lfd >= 0 && ctl != nullptr && ctl->sock_path[0] != '\0') {
+    unlink(ctl->sock_path);
   }
   if (!reported) {
     char code = static_cast<char>(fg_code);
     (void)!write(status_wfd, &code, 1);
+  }
+  if (stop) {
+    // CHECKPOINT_STOP: kill the whole namespace (every process but us) and
+    // drain it, then exit. As PID 1, kill(-1) targets all other processes.
+    kill(-1, SIGKILL);
+    while (true) {
+      int status;
+      pid_t w = waitpid(-1, &status, 0);
+      if (w < 0 && errno != EINTR) {
+        break;
+      }
+    }
   }
   _exit(fg_code);
 }
@@ -363,11 +682,16 @@ vector<string> EnvToStrings(const map<string, EnvVarValue> &env) {
 // *init_host_pid (so callers can identify our PID namespace unambiguously), and
 // true on a successful launch.
 //
+// `ctl` (if non-null) tells the init where to serve the checkpoint control
+// socket and how to run `criu dump` from inside the namespace; it must point at
+// storage that outlives this call's frame up to the init fork (fork copies the
+// frame, so a local is fine).
+//
 // The init outlives this call (it holds the namespace and the server open), so
 // we deliberately do not wait for it; we only reap the throwaway userns-setup
 // child. Mirrors horapha's nsrun.Run + runInit.
 bool RunInNamespace(const vector<string> &fg_argv, const vector<string> &fg_env,
-                    int *fg_code, int *init_host_pid) {
+                    const InitControl *ctl, int *fg_code, int *init_host_pid) {
   // Build the NULL-terminated argv/envp arrays BEFORE forking, so the post-fork
   // code paths perform no heap allocation and stay async-fork-safe. The backing
   // string vectors must outlive the fork.
@@ -446,7 +770,7 @@ bool RunInNamespace(const vector<string> &fg_argv, const vector<string> &fg_env,
       _exit(1);
     }
     if (init == 0) {
-      RunInit(argv.data(), envp.data(), status_pipe[1]);  // never returns
+      RunInit(argv.data(), envp.data(), status_pipe[1], ctl);  // never returns
     }
     // Tell the launcher the init's host pid, then exit. The init keeps
     // status_pipe[1] open and reparents to a host subreaper.
@@ -760,6 +1084,94 @@ string CriuBinary() {
   return criu.empty() ? "criu" : criu;
 }
 
+// Returns the checkpoint control socket path for an output_base.
+blaze_util::Path ControlSocketPath(const blaze_util::Path &output_base) {
+  return output_base.GetRelative(kControlSockName);
+}
+
+// Owns the strings an InitControl points at and exposes a populated
+// InitControl. Build one in the frame that calls RunInNamespace so the storage
+// outlives the forks down to the init. `images_dir` etc. are derived from
+// output_base; `sock` empty disables control serving.
+struct InitControlStorage {
+  string sock;
+  string criu_bin;
+  string images_dir;
+  string ns_pid_file;
+  string server_pid_file;
+  InitControl ctl;
+
+  InitControlStorage(const blaze_util::Path &output_base, bool serve_control) {
+    const blaze_util::Path images = output_base.GetRelative(kCriuImagesSubdir);
+    const blaze_util::Path server = output_base.GetRelative("server");
+    sock = serve_control ? ControlSocketPath(output_base).AsNativePath() : "";
+    criu_bin = CriuBinary();
+    images_dir = images.AsNativePath();
+    ns_pid_file = images.GetRelative(kNsPidFile).AsNativePath();
+    server_pid_file = server.GetRelative(kServerPidFile).AsNativePath();
+    ctl.sock_path = sock.c_str();
+    ctl.criu_bin = criu_bin.c_str();
+    ctl.images_dir = images_dir.c_str();
+    ctl.ns_pid_file = ns_pid_file.c_str();
+    ctl.server_pid_file = server_pid_file.c_str();
+  }
+};
+
+// Sends one command line to the init's control socket at output_base and reads
+// its reply. Returns true if the socket answered (whether OK or ERR); *response
+// holds the reply line (without the trailing newline). Used host-side by
+// CriuCheckpoint and by the "is a namespaced server already running?" probe.
+bool ControlRequest(const blaze_util::Path &output_base, const string &cmd,
+                    int timeout_secs, string *response) {
+  const string path = ControlSocketPath(output_base).AsNativePath();
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  if (path.size() >= sizeof(addr.sun_path)) {
+    return false;
+  }
+  strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+
+  int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    return false;
+  }
+  struct timeval tv;
+  tv.tv_sec = timeout_secs;
+  tv.tv_usec = 0;
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+  if (connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) !=
+      0) {
+    close(fd);
+    return false;  // no init listening (no namespaced server running)
+  }
+  const string line = cmd + "\n";
+  if (write(fd, line.data(), line.size()) != static_cast<ssize_t>(line.size())) {
+    close(fd);
+    return false;
+  }
+  string out;
+  char buf[256];
+  while (true) {
+    ssize_t r = read(fd, buf, sizeof(buf));
+    if (r <= 0) {
+      break;
+    }
+    out.append(buf, r);
+    if (out.find('\n') != string::npos) {
+      break;
+    }
+  }
+  close(fd);
+  if (out.empty()) {
+    return false;
+  }
+  *response = Stripped(out);
+  return true;
+}
+
 }  // namespace
 
 int ExecuteDaemonInNamespace(const blaze_util::Path &exe,
@@ -785,9 +1197,15 @@ int ExecuteDaemonInNamespace(const blaze_util::Path &exe,
   fg_argv.push_back(exe.AsNativePath());
   fg_argv.insert(fg_argv.end(), args_vector.begin(), args_vector.end());
 
+  // The init serves a checkpoint control socket so a later host-side
+  // CriuCheckpoint can ask it to `criu dump` from inside the namespace.
+  // server_dir is $output_base/server, so its parent is output_base.
+  InitControlStorage ctl(server_dir.GetParent(), /*serve_control=*/true);
+
   int fg_code = 0;
   int init_host_pid = 0;
-  if (!RunInNamespace(fg_argv, EnvToStrings(env), &fg_code, &init_host_pid) ||
+  if (!RunInNamespace(fg_argv, EnvToStrings(env), &ctl.ctl, &fg_code,
+                      &init_host_pid) ||
       fg_code != 0) {
     BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
         << "criu: failed to start namespaced server (daemonize exit "
@@ -853,12 +1271,10 @@ bool CriuRestore(const blaze_util::Path &output_base) {
       "--tcp-close",
       // Allow checkpointing processes with a controlling terminal.
       "--shell-job",
+      // Restore the flock()s the server held at dump time (see RunCriuDump).
+      "--file-locks",
       // Relax checks for rootless operation on the shared host network ns.
       "--unprivileged",
-      // Tolerate the inherited, locked FUSE/squashfs/snap mounts (see
-      // kCriuEnableFs). Must match the flag used for `criu dump`.
-      "--enable-fs",
-      kCriuEnableFs,
       "--log-file",
       images_dir.GetRelative("restore.log").AsNativePath(),
       "-v4",
@@ -870,9 +1286,14 @@ bool CriuRestore(const blaze_util::Path &output_base) {
     env.push_back(*e);
   }
 
+  // The revived init serves the same checkpoint control socket as a fresh
+  // namespaced start, so the server can be re-checkpointed after a restore.
+  InitControlStorage ctl(output_base, /*serve_control=*/true);
+
   int fg_code = 0;
   int init_host_pid = 0;
-  if (!RunInNamespace(fg_argv, env, &fg_code, &init_host_pid) || fg_code != 0) {
+  if (!RunInNamespace(fg_argv, env, &ctl.ctl, &fg_code, &init_host_pid) ||
+      fg_code != 0) {
     BAZEL_LOG(USER) << "criu: restore failed (exit " << fg_code << "); see "
                     << images_dir.GetRelative("restore.log").AsPrintablePath();
     return false;
@@ -888,6 +1309,39 @@ bool CriuRestore(const blaze_util::Path &output_base) {
   }
   BAZEL_LOG(USER) << "Restored; server reachable at host pid " << host_pid;
   return true;
+}
+
+int CriuCheckpoint(const blaze_util::Path &output_base) {
+  // BAZEL_CRIU_CHECKPOINT=stop means dump and then tear the server down.
+  const bool stop = GetEnv("BAZEL_CRIU_CHECKPOINT") == "stop";
+  const string cmd = stop ? "CHECKPOINT_STOP" : "CHECKPOINT";
+
+  const blaze_util::Path images_dir =
+      output_base.GetRelative(kCriuImagesSubdir);
+  BAZEL_LOG(USER) << "criu: requesting " << (stop ? "checkpoint+stop" : "checkpoint")
+                  << " -> " << images_dir.AsPrintablePath();
+
+  // The dump can take a while for a large heap; allow several minutes.
+  string response;
+  if (!ControlRequest(output_base, cmd, /*timeout_secs=*/300, &response)) {
+    BAZEL_LOG(USER)
+        << "criu: no namespaced server is serving the control socket at "
+        << ControlSocketPath(output_base).AsPrintablePath()
+        << " (is a BAZEL_CRIU server running?).";
+    return 1;
+  }
+  // Responses are "OK <msg>" / "ERR <msg>".
+  if (response.compare(0, 2, "OK") == 0) {
+    BAZEL_LOG(USER) << "criu: " << Stripped(response.substr(2));
+    return 0;
+  }
+  if (response.compare(0, 3, "ERR") == 0) {
+    BAZEL_LOG(USER) << "criu: checkpoint failed: "
+                    << Stripped(response.substr(3));
+    return 1;
+  }
+  BAZEL_LOG(USER) << "criu: malformed control response: " << response;
+  return 1;
 }
 
 }  // namespace blaze

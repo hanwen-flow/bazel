@@ -1774,6 +1774,13 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
 
   MaybeConfigureCriuMode(startup_options);
 
+  // A checkpoint request (BAZEL_CRIU_CHECKPOINT) does not run a bazel command:
+  // it asks the in-namespace init serving this output_base to `criu dump` the
+  // running server, then exits. Resolving output_base above is all we need.
+  if (CriuCheckpointRequested()) {
+    return CriuCheckpoint(startup_options->output_base);
+  }
+
   RunLauncher(self_path, archive_contents, install_md5, *startup_options,
               *option_processor, *workspace_layout, workspace, build_label,
               &logging_info, interceptor, command_extension_adder);

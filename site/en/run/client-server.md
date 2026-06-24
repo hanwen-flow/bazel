@@ -62,11 +62,11 @@ versioning.
 
 When the `BAZEL_CRIU` environment variable is set (Linux only), the launcher
 starts the server inside a fresh user + PID + mount namespace under a small
-persistent init process, and transparently restores a previously-saved
-[CRIU](https://criu.org) checkpoint from `{{ '<var>' }}output_base{{ '</var>'
-}}/criu/` whenever no server is running. The goal is to snapshot a warm server
-(its analysis cache and JIT-warmed JVM) to disk and bring it back later, e.g.
-across machine reboots or on CI runners.
+persistent init process, and transparently checkpoints and restores a
+[CRIU](https://criu.org) checkpoint under `{{ '<var>' }}output_base{{ '</var>'
+}}/criu/`. It restores from a saved checkpoint whenever no server is running.
+The goal is to snapshot a warm server (its analysis cache and JIT-warmed JVM) to
+disk and bring it back later, e.g. across machine reboots or on CI runners.
 
 In this mode the launcher:
 
@@ -82,8 +82,15 @@ In this mode the launcher:
   restored server has a brand-new start time and a namespace-local pid; the gRPC
   ping is the real liveness check.
 
+Checkpoints are taken from *inside* the namespace: the persistent init serves a
+control socket at `{{ '<var>' }}output_base{{ '</var>' }}/bazel-criu.sock`, and
+an invocation with `BAZEL_CRIU_CHECKPOINT` set asks it to run `criu dump`. Since
+the init holds `CAP_CHECKPOINT_RESTORE` over its own user namespace, the dump is
+**rootless** — no `sudo`, the images are owned by the invoking user, and the
+host's inherited snap/squashfs/FUSE mounts need no special handling. Set
+`BAZEL_CRIU_CHECKPOINT=stop` to also tear the server down after dumping.
+
 This requires a Linux kernel with unprivileged user namespaces enabled, `criu`
 on `$PATH` (override with `BAZEL_CRIU_BINARY`), and the `JniLoader` JNI-extract
 patch so the server's native libraries stay file-backed (rootless CRIU cannot
-dump unlinked-but-mapped files). Taking the checkpoint itself (`criu dump`) is
-driven by external tooling. This is a research experiment with rough edges.
+dump unlinked-but-mapped files). This is a research experiment with rough edges.
