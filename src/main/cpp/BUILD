@@ -17,6 +17,7 @@ WIN_LINK_OPTS = [
 cc_library(
     name = "blaze_util",
     srcs = [
+        "blaze_criu.cc",
         "blaze_util.cc",
         "server_process_info.h",
         "startup_options.h",
@@ -43,6 +44,7 @@ cc_library(
         ],
     }),
     hdrs = [
+        "blaze_criu.h",
         "blaze_util.h",
         "blaze_util_platform.h",
     ],
