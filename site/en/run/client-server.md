@@ -57,3 +57,33 @@ When running `bazel`, the client first checks that the server is the appropriate
 version; if not, the server is stopped and a new one started. This ensures that
 the use of a long-running server process doesn't interfere with proper
 versioning.
+
+## Experimental: CRIU checkpoint/restore {:#criu}
+
+When the `BAZEL_CRIU` environment variable is set (Linux only), the launcher
+starts the server inside a fresh user + PID + mount namespace under a small
+persistent init process, and transparently restores a previously-saved
+[CRIU](https://criu.org) checkpoint from `{{ '<var>' }}output_base{{ '</var>'
+}}/criu/` whenever no server is running. The goal is to snapshot a warm server
+(its analysis cache and JIT-warmed JVM) to disk and bring it back later, e.g.
+across machine reboots or on CI runners.
+
+In this mode the launcher:
+
+* forces `--max_idle_secs=0`, so the warm, snapshot-worthy server never
+  self-terminates;
+* runs the server in a PID namespace, giving it a stable, low namespace-local
+  pid that rootless CRIU can re-create exactly on restore (the network namespace
+  is shared with the host, so ordinary clients still reach the gRPC port over
+  loopback);
+* rewrites the server's on-disk identity (`server_info.rawproto`,
+  `server.starttime`) to its *host* pid so a host-side client can attach;
+* skips the `/proc` start-time check when validating the server process, since a
+  restored server has a brand-new start time and a namespace-local pid; the gRPC
+  ping is the real liveness check.
+
+This requires a Linux kernel with unprivileged user namespaces enabled, `criu`
+on `$PATH` (override with `BAZEL_CRIU_BINARY`), and the `JniLoader` JNI-extract
+patch so the server's native libraries stay file-backed (rootless CRIU cannot
+dump unlinked-but-mapped files). Taking the checkpoint itself (`criu dump`) is
+driven by external tooling. This is a research experiment with rough edges.

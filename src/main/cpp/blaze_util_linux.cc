@@ -27,6 +27,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "src/main/cpp/blaze_criu.h"
 #include "src/main/cpp/blaze_util_platform.h"
 #include "src/main/cpp/util/errors.h"
 #include "src/main/cpp/util/exit_code.h"
@@ -214,6 +215,15 @@ bool VerifyServerProcess(int pid, const blaze_util::Path &output_base) {
     // Cannot read PID file from /proc . Process died meantime, all is good. No
     // stale server is present.
     return false;
+  }
+
+  // In CRIU mode the recorded pid/starttime do not reliably match the host
+  // process: the server lives in a PID namespace (its on-disk pid was rewritten
+  // to a host pid), and a restored server has a brand-new start time. The
+  // process existing under `pid` is sufficient here; the subsequent gRPC ping
+  // is the real liveness arbiter. See blaze_criu.cc.
+  if (CriuModeActive()) {
+    return true;
   }
 
   string recorded_start_time;

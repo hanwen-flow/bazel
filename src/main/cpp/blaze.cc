@@ -62,6 +62,7 @@
 #endif
 
 #include "src/main/cpp/archive_utils.h"
+#include "src/main/cpp/blaze_criu.h"
 #include "src/main/cpp/blaze_util.h"
 #include "src/main/cpp/blaze_util_platform.h"
 #include "src/main/cpp/option_processor.h"
@@ -911,6 +912,13 @@ static void ConnectOrDie(const OptionProcessor &option_processor,
 static void EnsurePreviousServerProcessTerminated(
     const blaze_util::Path &server_dir, const StartupOptions &startup_options,
     LoggingInfo *logging_info) {
+  // In CRIU mode server.pid.txt holds the server's *namespace-local* pid, which
+  // is meaningless on the host: KillServerProcess would killpg() an unrelated
+  // host process group. We only reach a cold start here after failing to attach
+  // to or restore any existing server, so there is nothing host-killable to do.
+  if (CriuModeActive()) {
+    return;
+  }
   int server_pid = GetServerPid(server_dir);
   if (server_pid > 0) {
     if (VerifyServerProcess(server_pid, startup_options.output_base)) {
@@ -976,11 +984,25 @@ static void StartServerAndConnect(
                   << " server (" << build_label << ")"
                   << " and connecting to it...";
   BlazeServerStartup *server_startup;
-  const int server_pid = ExecuteDaemon(
-      server_exe, server_exe_args, PrepareEnvironmentForJvm(),
-      server->ProcessInfo().jvm_log_file_,
-      server->ProcessInfo().jvm_log_file_append_, startup_options.install_base,
-      server_dir, startup_options, &server_startup);
+  int server_pid;
+  if (CriuModeActive()) {
+    // Start the server inside a fresh PID namespace under a persistent init, so
+    // its process tree has reproducible low PIDs that rootless CRIU can later
+    // checkpoint and restore. Returns the server's *host* pid (the function has
+    // already rewritten the on-disk identity so host clients can attach).
+    server_pid = ExecuteDaemonInNamespace(
+        server_exe, server_exe_args, PrepareEnvironmentForJvm(),
+        server->ProcessInfo().jvm_log_file_,
+        server->ProcessInfo().jvm_log_file_append_,
+        startup_options.install_base, server_dir, &server_startup);
+  } else {
+    server_pid = ExecuteDaemon(
+        server_exe, server_exe_args, PrepareEnvironmentForJvm(),
+        server->ProcessInfo().jvm_log_file_,
+        server->ProcessInfo().jvm_log_file_append_,
+        startup_options.install_base, server_dir, startup_options,
+        &server_startup);
+  }
 
   ConnectOrDie(option_processor, startup_options, server_pid, server_startup,
                server);
@@ -1201,10 +1223,22 @@ static ATTRIBUTE_NORETURN void RunClientServerMode(
     const string &build_label) {
   while (true) {
     if (!server->Connected()) {
-      StartServerAndConnect(server_exe, server_exe_args, server_dir,
-                            workspace_layout, workspace, option_processor,
-                            startup_options, logging_info, server, build_label,
-                            interceptor);
+      // In CRIU mode, if no server is running but a checkpoint exists, restore
+      // the warm server instead of cold-starting one, so the user transparently
+      // reattaches to their saved server. Best-effort: on failure we fall
+      // through to a normal (cold) namespaced start below.
+      if (CriuModeActive() && CriuCheckpointExists(startup_options.output_base)) {
+        BAZEL_LOG(USER) << "No server running; restoring CRIU checkpoint.";
+        if (CriuRestore(startup_options.output_base)) {
+          server->Connect();
+        }
+      }
+      if (!server->Connected()) {
+        StartServerAndConnect(server_exe, server_exe_args, server_dir,
+                              workspace_layout, workspace, option_processor,
+                              startup_options, logging_info, server,
+                              build_label, interceptor);
+      }
     }
 
     // Check for the case when the workspace directory deleted and then gets
@@ -1278,6 +1312,47 @@ static string GetCanonicalCwd() {
         << "') failed: " << GetLastErrorString();
   }
   return result;
+}
+
+// Returns true if host_jvm_args already carries a -D<prefix...> property, so we
+// do not override a value the user set explicitly.
+static bool HasHostJvmProperty(const vector<string> &host_jvm_args,
+                               const string &property_prefix) {
+  for (const string &arg : host_jvm_args) {
+    if (arg.compare(0, property_prefix.size(), property_prefix) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// When BAZEL_CRIU is active, adjust startup options and environment so the
+// server we (re)start is checkpointable and never self-terminates:
+//   - --max_idle_secs=0: a warm, snapshot-worthy server must not idle out.
+//   - -Duser.home: the server runs as uid 0 inside the user namespace, so the
+//     JVM would otherwise resolve "~" to /root via getpwuid; pin it to the real
+//     home so bazel expands "~" (e.g. in a disk cache path) correctly.
+// Every native library the server maps is already packaged loose in the install
+// base and loaded from java.library.path (bazel's own libunix_jni via JniLoader,
+// and the third-party libs netty/zstd/async-profiler), so no native lib is
+// extracted to a /tmp file that rootless CRIU could not checkpoint; nothing
+// extra is needed here for that.
+// No-op unless CRIU mode is active. These mutations happen before RunLauncher,
+// so they flow into both the server JVM command line and the cmdline file used
+// to decide whether a running server's startup options still match.
+static void MaybeConfigureCriuMode(StartupOptions *startup_options) {
+  if (!CriuModeActive()) {
+    return;
+  }
+
+  startup_options->max_idle_secs = 0;
+
+  if (!HasHostJvmProperty(startup_options->host_jvm_args, "-Duser.home=")) {
+    const string home = GetEnv("HOME");
+    if (!home.empty()) {
+      startup_options->host_jvm_args.push_back("-Duser.home=" + home);
+    }
+  }
 }
 
 static void PrepareDirectories(StartupOptions *startup_options) {
@@ -1696,6 +1771,8 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
       install_md5, workspace, IsServerMode(option_processor->GetCommand()));
 
   PrepareDirectories(startup_options);
+
+  MaybeConfigureCriuMode(startup_options);
 
   RunLauncher(self_path, archive_contents, install_md5, *startup_options,
               *option_processor, *workspace_layout, workspace, build_label,
