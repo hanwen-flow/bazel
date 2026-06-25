@@ -452,6 +452,19 @@ static vector<string> GetServerExeArgs(const blaze_util::Path &jvm_path,
   // Let the system decide whether to prefer IPv6
   result.push_back("-Djava.net.preferIPv6Addresses=system");
 
+  // Point zstd-jni at its native library, packaged loose in the install base
+  // (see //third_party:bundled_native_libs). zstd-jni's loader honors
+  // -DZstdNativePath as a full
+  // path to the .so and loads it directly, instead of copying the bundled
+  // resource to /tmp and unlinking it. Keeping it file-backed at a stable path
+  // is required to checkpoint/restore the server with rootless CRIU; for the
+  // normal case it just avoids per-start temp churn. Unlike netty (which finds
+  // its loose lib on java.library.path automatically), zstd requests a
+  // versioned name the bundled basename lacks, so the explicit flag is needed.
+  result.push_back("-DZstdNativePath=" +
+                   real_install_dir.GetRelative("libzstd-jni.so")
+                       .AsJvmArgument());
+
 #if defined(_WIN32)
   // See and use more than 64 CPUs on Windows.
   // https://bugs.openjdk.org/browse/JDK-6942632
