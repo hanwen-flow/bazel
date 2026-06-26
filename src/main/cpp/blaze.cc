@@ -1360,6 +1360,21 @@ static void MaybeConfigureCriuMode(StartupOptions *startup_options) {
 
   startup_options->max_idle_secs = 0;
 
+  // Keep the JVM's perf-counter data in heap memory instead of an mmap'd
+  // /tmp/hsperfdata_<user>/<pid> file. By default the JVM maps that file into
+  // its address space; criu records it as a regular-file mapping to reopen by
+  // path on restore. The file lives in volatile /tmp and the JVM deletes it on
+  // exit, so after a reboot -- or a graceful `bazel shutdown` between a restore
+  // and the next restore -- the path is gone and criu's restore fails with
+  // "Can't open file tmp/hsperfdata_<user>/<pid>". Disabling the shared-memory
+  // perf data removes the mapping entirely.
+  if (!HasHostJvmProperty(startup_options->host_jvm_args,
+                          "-XX:+PerfDisableSharedMem") &&
+      !HasHostJvmProperty(startup_options->host_jvm_args,
+                          "-XX:-PerfDisableSharedMem")) {
+    startup_options->host_jvm_args.push_back("-XX:+PerfDisableSharedMem");
+  }
+
   if (!HasHostJvmProperty(startup_options->host_jvm_args, "-Duser.home=")) {
     const string home = GetEnv("HOME");
     if (!home.empty()) {
