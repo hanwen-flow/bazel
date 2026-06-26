@@ -39,6 +39,17 @@ constexpr char kCriuImagesSubdir[] = "criu";
 // without trusting bazel's mutable server.pid.txt. Matches horapha's
 // serverinfo.CheckpointPIDName.
 constexpr char kNsPidFile[] = "ns-pid";
+// The server identity file a client reads to connect: it carries the server's
+// address (port), request/response cookies and pid. The server writes it once
+// at startup and registers it for deletion at JVM exit, so a graceful
+// `bazel shutdown` between checkpoints unlinks it -- and the restored process
+// never rewrites it. The in-namespace init therefore snapshots it next to the
+// checkpoint images at dump time, and restore copies it back before patching
+// the pid. The port and cookies inside stay valid across restores (they are
+// baked into the restored process's memory); only the pid/starttime change.
+// This basename is used both for the live file under $output_base/server and
+// for its snapshot under the images dir.
+constexpr char kServerInfoName[] = "server_info.rawproto";
 // Control socket (relative to output_base) on which the in-namespace init
 // listens for checkpoint requests. It lives on the shared output_base mount so
 // a host-side launcher can reach it; the init is the only process that can run
@@ -307,6 +318,11 @@ struct InitControl {
   const char *images_dir;
   const char *ns_pid_file;
   const char *server_pid_file;
+  // Live $output_base/server/server_info.rawproto, snapshotted at dump time.
+  const char *server_info_file;
+  // Where the snapshot is written (inside images_dir), so restore can recover
+  // it after a graceful shutdown deletes the live file.
+  const char *server_info_snapshot;
 };
 
 // Reads a small unsigned decimal from `path` (e.g. server.pid.txt). Returns -1
@@ -334,6 +350,54 @@ int ReadIntFromFile(const char *path) {
     }
   }
   return any ? v : -1;
+}
+
+// Copies the file at `src` to `dst` (truncating dst), preserving contents only.
+// Fork-safe: open/read/write/close in a fixed buffer, no allocation. Returns
+// false on any error (e.g. src missing).
+bool CopyFileRaw(const char *src, const char *dst) {
+  int in = open(src, O_RDONLY | O_CLOEXEC);
+  if (in < 0) {
+    return false;
+  }
+  int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (out < 0) {
+    close(in);
+    return false;
+  }
+  char buf[65536];
+  bool ok = true;
+  while (true) {
+    ssize_t n = read(in, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      ok = false;
+      break;
+    }
+    if (n == 0) {
+      break;
+    }
+    ssize_t off = 0;
+    while (off < n) {
+      ssize_t w = write(out, buf + off, n - off);
+      if (w < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        ok = false;
+        break;
+      }
+      off += w;
+    }
+    if (!ok) {
+      break;
+    }
+  }
+  close(in);
+  close(out);
+  return ok;
 }
 
 // Writes "<value>\n" to `path`, creating/truncating it. Fork-safe.
@@ -470,6 +534,14 @@ bool RunCriuDump(const InitControl *ctl, bool leave_running) {
     // Record the checkpointed ns-local pid alongside the images so restore can
     // locate the revived server without trusting bazel's mutable pid file.
     WriteIntFile(ctl->ns_pid_file, ns_pid);
+    // Snapshot server_info.rawproto next to the images. The restored process
+    // does not rewrite this file, and a graceful `bazel shutdown` between
+    // checkpoints deletes the live copy (it is registered for deleteAtExit), so
+    // restore recovers it from here. Best-effort: a missing snapshot only means
+    // a later restore falls back to whatever is on disk.
+    if (!CopyFileRaw(ctl->server_info_file, ctl->server_info_snapshot)) {
+      ChildPerror("snapshot server_info.rawproto");
+    }
   }
   return ok;
 }
@@ -1099,6 +1171,8 @@ struct InitControlStorage {
   string images_dir;
   string ns_pid_file;
   string server_pid_file;
+  string server_info_file;
+  string server_info_snapshot;
   InitControl ctl;
 
   InitControlStorage(const blaze_util::Path &output_base, bool serve_control) {
@@ -1109,11 +1183,15 @@ struct InitControlStorage {
     images_dir = images.AsNativePath();
     ns_pid_file = images.GetRelative(kNsPidFile).AsNativePath();
     server_pid_file = server.GetRelative(kServerPidFile).AsNativePath();
+    server_info_file = server.GetRelative(kServerInfoName).AsNativePath();
+    server_info_snapshot = images.GetRelative(kServerInfoName).AsNativePath();
     ctl.sock_path = sock.c_str();
     ctl.criu_bin = criu_bin.c_str();
     ctl.images_dir = images_dir.c_str();
     ctl.ns_pid_file = ns_pid_file.c_str();
     ctl.server_pid_file = server_pid_file.c_str();
+    ctl.server_info_file = server_info_file.c_str();
+    ctl.server_info_snapshot = server_info_snapshot.c_str();
   }
 };
 
@@ -1297,6 +1375,27 @@ bool CriuRestore(const blaze_util::Path &output_base) {
     BAZEL_LOG(USER) << "criu: restore failed (exit " << fg_code << "); see "
                     << images_dir.GetRelative("restore.log").AsPrintablePath();
     return false;
+  }
+
+  // Recover server_info.rawproto from the checkpoint-time snapshot if the live
+  // file is gone (a graceful `bazel shutdown` between checkpoints deletes it,
+  // and the restored process never rewrites it). MakeReachable patches the pid
+  // field in place, so the file must exist first; the embedded port/cookies are
+  // still valid for the revived process.
+  const blaze_util::Path live_info = server_dir.GetRelative(kServerInfoName);
+  const blaze_util::Path snapshot_info =
+      images_dir.GetRelative(kServerInfoName);
+  if (!blaze_util::PathExists(live_info) &&
+      blaze_util::PathExists(snapshot_info)) {
+    string bytes;
+    // A graceful shutdown may have removed the whole server dir, so recreate it.
+    if (!blaze_util::MakeDirectories(server_dir, 0755) ||
+        !blaze_util::ReadFile(snapshot_info, &bytes) ||
+        !blaze_util::WriteFile(bytes, live_info)) {
+      BAZEL_LOG(USER) << "criu: could not restore server_info.rawproto from "
+                      << snapshot_info.AsPrintablePath();
+      return false;
+    }
   }
 
   // The restored server has a new host pid and start time; point the client's
