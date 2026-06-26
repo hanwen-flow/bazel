@@ -65,13 +65,29 @@ public final class JniLoader {
    *     other reason
    */
   private static void loadLibrary(String resourceName) throws IOException {
+    int slash = resourceName.lastIndexOf('/');
+    checkArgument(slash != -1, "resourceName must contain two path components");
+    String baseName = resourceName.substring(slash + 1);
+
+    // Prefer a file-backed copy already on java.library.path. The launcher
+    // packages this library loose in the install base (see //src/main/native:
+    // jni_lib), whose root is on java.library.path, so System.loadLibrary maps
+    // the on-disk file in place. That keeps the mapping backed by a stable file
+    // -- which rootless CRIU needs to checkpoint/restore the server -- and
+    // avoids the extract-to-/tmp-then-unlink path below. Tests and other
+    // contexts without a packaged install base fall through to that path.
+    try {
+      System.loadLibrary(libraryName(baseName));
+      return;
+    } catch (UnsatisfiedLinkError e) {
+      // Not on java.library.path; extract the bundled resource instead.
+    }
+
     Path dir = null;
     Path tempFile = null;
     try {
       dir = Files.createTempDirectory("bazel-jni.");
-      int slash = resourceName.lastIndexOf('/');
-      checkArgument(slash != -1, "resourceName must contain two path components");
-      tempFile = dir.resolve(resourceName.substring(slash + 1));
+      tempFile = dir.resolve(baseName);
 
       ClassLoader loader = JniLoader.class.getClassLoader();
       try (InputStream resource = loader.getResourceAsStream(resourceName)) {
@@ -115,6 +131,24 @@ public final class JniLoader {
       }
       throw e;
     }
+  }
+
+  /**
+   * Converts a mangled shared-library basename (e.g. {@code libunix_jni.so}, {@code
+   * libunix_jni.dylib}, {@code windows_jni.dll}) into the bare name {@link System#loadLibrary}
+   * expects (e.g. {@code unix_jni}, {@code windows_jni}): strips a leading {@code lib} (not present
+   * on Windows) and the file extension.
+   */
+  private static String libraryName(String baseName) {
+    String name = baseName;
+    if (name.startsWith("lib")) {
+      name = name.substring("lib".length());
+    }
+    int dot = name.lastIndexOf('.');
+    if (dot != -1) {
+      name = name.substring(0, dot);
+    }
+    return name;
   }
 
   private JniLoader() {}

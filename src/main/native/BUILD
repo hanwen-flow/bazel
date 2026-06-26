@@ -116,6 +116,24 @@ genrule(
     visibility = ["//src/main/java/com/google/devtools/build/lib/jni:__pkg__"],
 )
 
+# The platform JNI library, exposed so it can be packaged as a loose, file-backed
+# member of the install base (next to libcpu_profiler.so) rather than only inside
+# A-server.jar. The install base root is on java.library.path, so JniLoader loads
+# this copy via System.loadLibrary instead of extracting the jar resource to a
+# /tmp file it then unlinks -- a deleted-but-mapped /tmp file cannot be
+# checkpointed by rootless CRIU. The basename must match System.mapLibraryName of
+# the name JniLoader passes (unix_jni / windows_jni), which the cc_binary outputs
+# already satisfy. See //src:package-zip and JniLoader.java.
+filegroup(
+    name = "jni_lib",
+    srcs = select({
+        "//src/conditions:darwin": [":libunix_jni.dylib"],
+        "//src/conditions:windows": ["//src/main/native/windows:windows_jni.dll"],
+        "//conditions:default": [":libunix_jni.so"],
+    }),
+    visibility = ["//src:__pkg__"],
+)
+
 filegroup(
     name = "srcs",
     srcs = glob(["**"]) + [
