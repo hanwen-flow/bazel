@@ -35,6 +35,7 @@ sh_binary(
         # otherwise bazel won't correctly reextract modified files.
         "//src/main/java/com/google/devtools/build/lib/bazel:BazelServer_deploy.jar",
         "//src/main/java/net/starlark/java/eval:cpu_profiler_jni",
+        "//src/main/native:jni_lib",
         "//src/main/cpp:client",
         "//src/main/tools:process-wrapper",
         "//src/main/tools:linux-sandbox",
@@ -296,6 +297,7 @@ genrule(
         "//:platforms-srcs",
         # Non-ordered items follow:
         "//src/main/java/net/starlark/java/eval:cpu_profiler_jni",
+        "//src/main/native:jni_lib",
         "//src/main/tools:process-wrapper",
         "//src/main/tools:linux-sandbox",
         "//tools/osx:xcode-locator",
