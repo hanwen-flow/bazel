@@ -38,6 +38,7 @@ sh_binary(
         "//src/main/tools:linux-sandbox",
         "//tools/osx:xcode-locator",
         "//:platforms-srcs",
+        "//third_party:bundled_native_libs",
     ] + select({
         "//src/conditions:windows": [],
         "//conditions:default": [
@@ -317,6 +318,7 @@ genrule(
         "//src/main/tools:process-wrapper",
         "//src/main/tools:linux-sandbox",
         "//tools/osx:xcode-locator",
+        "//third_party:bundled_native_libs",
     ] + select({
         "//src/conditions:windows": [],
         "//conditions:default": [

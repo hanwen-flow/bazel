@@ -299,6 +299,79 @@ java_library(
     }),
 )
 
+# Native libraries that some of our dependencies bundle inside their jars and,
+# by default, extract to a random /tmp path at load time and unlink after
+# loading. That deleted-but-mapped /tmp file cannot be checkpointed by rootless
+# CRIU and is gone after a reboot. We instead package each of these as a loose,
+# file-backed .so directly in the install base (which is on java.library.path),
+# so each loader finds and maps the on-disk copy in place. See
+# src/main/cpp/blaze.cc (CRIU mode) and src/main/cpp/archive_utils.cc.
+#
+# The loose .so basename must be exactly what the loader looks for. For netty
+# that is System.mapLibraryName(<unshaded name it requests>), which equals the
+# jar member's own basename (e.g. libnetty_transport_native_epoll_x86_64.so), so
+# we unzip the single member out under that name. Because genrule outs cannot be
+# configurable, there is one genrule per (library, arch) and the filegroup
+# selects the host arch. zstd is matched via the -DZstdNativePath JVM flag (set
+# in blaze.cc), since the name it passes to System.loadLibrary carries a version
+# suffix the bundled basename lacks. async-profiler already exposes its .so as a
+# loose, correctly-named build artifact, referenced directly below; zstd builds
+# its .so from source into a package-private cc_binary, so we take it out of the
+# public java_library's jar (where it is bundled as a resource) instead.
+[genrule(
+    name = "extract_" + member,
+    srcs = [jar],
+    outs = [member],
+    cmd = "unzip -p $< " + path + " > $@",
+) for member, jar, path in [
+    (
+        "libnetty_transport_native_epoll_x86_64.so",
+        "@maven//:io_netty_netty_transport_native_epoll_linux_x86_64_file",
+        "META-INF/native/libnetty_transport_native_epoll_x86_64.so",
+    ),
+    (
+        "libnetty_transport_native_epoll_aarch_64.so",
+        "@maven//:io_netty_netty_transport_native_epoll_linux_aarch_64_file",
+        "META-INF/native/libnetty_transport_native_epoll_aarch_64.so",
+    ),
+    (
+        "libnetty_tcnative_linux_x86_64.so",
+        ":netty_tcnative/netty-tcnative-filtered.jar",
+        "META-INF/native/libnetty_tcnative_linux_x86_64.so",
+    ),
+    (
+        "libnetty_tcnative_linux_aarch_64.so",
+        ":netty_tcnative/netty-tcnative-filtered.jar",
+        "META-INF/native/libnetty_tcnative_linux_aarch_64.so",
+    ),
+    (
+        "libzstd-jni.so",
+        "@zstd-jni//:libzstd-jni.jar",
+        "libzstd-jni.so",
+    ),
+]]
+
+# All native libraries to package loose in the install base, for the host
+# platform only. Empty on platforms where the libraries aren't applicable.
+filegroup(
+    name = "bundled_native_libs",
+    srcs = select({
+        "//src/conditions:linux_aarch64": [
+            ":extract_libnetty_transport_native_epoll_aarch_64.so",
+            ":extract_libnetty_tcnative_linux_aarch_64.so",
+            ":extract_libzstd-jni.so",
+            "@async_profiler_linux_arm64//:libasyncProfiler",
+        ],
+        "//src/conditions:linux_x86_64": [
+            ":extract_libnetty_transport_native_epoll_x86_64.so",
+            ":extract_libnetty_tcnative_linux_x86_64.so",
+            ":extract_libzstd-jni.so",
+            "@async_profiler_linux_x64//:libasyncProfiler",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
 alias(
     name = "checker_framework_annotations",
     actual = "@maven//:org_checkerframework_checker_qual",
