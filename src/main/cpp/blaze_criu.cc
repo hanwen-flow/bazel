@@ -1370,9 +1370,15 @@ bool CriuRestore(const blaze_util::Path &output_base) {
   // preserves across restore), NOT the host pid we later patch into the rawproto
   // for the client. A `criu dump`/SIGKILL teardown leaves this file intact, so
   // rewriting it to the same ns_pid is harmless there.
+  //
+  // Write the bare decimal with NO trailing newline: `daemonize` writes the pid
+  // as `fprintf("%d", pid)` and both the in-JVM watcher (PidFileWatcher) and the
+  // server's startup readPidFile parse it with a strict `Integer.parseInt`,
+  // which throws on a trailing '\n'. A newline here makes pidFileValid() return
+  // false on the watcher's first post-restore tick, halting the server.
   const blaze_util::Path pid_file = server_dir.GetRelative(kServerPidFile);
   if (!blaze_util::MakeDirectories(server_dir, 0755) ||
-      !blaze_util::WriteFile(std::to_string(ns_pid) + "\n", pid_file)) {
+      !blaze_util::WriteFile(std::to_string(ns_pid), pid_file)) {
     BAZEL_LOG(USER) << "criu: could not write " << pid_file.AsPrintablePath();
     return false;
   }
