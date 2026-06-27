@@ -56,6 +56,14 @@ constexpr char kServerInfoName[] = "server_info.rawproto";
 // criu, since CAP_CHECKPOINT_RESTORE is held only inside the user namespace.
 // Matches horapha's control.SockName.
 constexpr char kControlSockName[] = "bazel-criu.sock";
+// File (inside the images dir) recording the install_base identity (the
+// install_md5, which is the install_base's basename) of the binary that took
+// the checkpoint. Restore refuses a checkpoint whose key does not match the
+// current binary: a server image from an old binary must not be revived under a
+// new one. We cannot reuse output_base/install for this, because the normal
+// version check (EnsureCorrectRunningVersion) rewrites that symlink to the
+// current install_base before restore runs.
+constexpr char kInstallKeyFile[] = "install-key";
 }  // namespace
 
 bool CriuModeActive() {
@@ -74,9 +82,24 @@ bool CriuCheckpointRequested() {
 #endif
 }
 
-bool CriuCheckpointExists(const blaze_util::Path &output_base) {
-  return blaze_util::PathExists(
-      output_base.GetRelative(kCriuImagesSubdir).GetRelative(kNsPidFile));
+bool CriuCheckpointExists(const blaze_util::Path &output_base,
+                          const std::string &install_md5) {
+  const blaze_util::Path images = output_base.GetRelative(kCriuImagesSubdir);
+  // Need the recorded ns-local pid that restore relies on.
+  if (!blaze_util::PathExists(images.GetRelative(kNsPidFile))) {
+    return false;
+  }
+  // The checkpoint must have been taken by this same binary. A checkpoint
+  // predating this key file, or one from a different install_base, is treated
+  // as absent so the launcher cold-starts the current binary instead of
+  // reviving an image built by another one.
+  std::string recorded_key;
+  if (!blaze_util::ReadFile(images.GetRelative(kInstallKeyFile),
+                            &recorded_key)) {
+    return false;
+  }
+  blaze_util::StripWhitespace(&recorded_key);
+  return recorded_key == install_md5;
 }
 
 }  // namespace blaze
@@ -99,7 +122,7 @@ int ExecuteDaemonInNamespace(const blaze_util::Path &, const vector<string> &,
 
 bool CriuRestore(const blaze_util::Path &) { return false; }
 
-int CriuCheckpoint(const blaze_util::Path &) {
+int CriuCheckpoint(const blaze_util::Path &, const std::string &) {
   BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
       << "BAZEL_CRIU is only supported on Linux.";
   return -1;
@@ -1410,7 +1433,8 @@ bool CriuRestore(const blaze_util::Path &output_base) {
   return true;
 }
 
-int CriuCheckpoint(const blaze_util::Path &output_base) {
+int CriuCheckpoint(const blaze_util::Path &output_base,
+                   const std::string &install_md5) {
   // BAZEL_CRIU_CHECKPOINT=stop means dump and then tear the server down.
   const bool stop = GetEnv("BAZEL_CRIU_CHECKPOINT") == "stop";
   const string cmd = stop ? "CHECKPOINT_STOP" : "CHECKPOINT";
@@ -1431,6 +1455,19 @@ int CriuCheckpoint(const blaze_util::Path &output_base) {
   }
   // Responses are "OK <msg>" / "ERR <msg>".
   if (response.compare(0, 2, "OK") == 0) {
+    // Record which binary produced this checkpoint so a later restore can
+    // reject it under a different binary. Written after the dump succeeded;
+    // sibling metadata, not part of the criu image (like ns-pid). On failure
+    // we remove any stale key so the checkpoint reads as "not restorable by
+    // this or any binary" rather than silently matching an old image.
+    if (!blaze_util::WriteFile(install_md5,
+                               images_dir.GetRelative(kInstallKeyFile))) {
+      BAZEL_LOG(USER) << "criu: warning: could not record install key at "
+                      << images_dir.GetRelative(kInstallKeyFile)
+                             .AsPrintablePath()
+                      << "; the checkpoint will not be restored.";
+      blaze_util::UnlinkPath(images_dir.GetRelative(kInstallKeyFile));
+    }
     BAZEL_LOG(USER) << "criu: " << Stripped(response.substr(2));
     return 0;
   }

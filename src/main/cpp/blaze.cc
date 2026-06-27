@@ -222,6 +222,10 @@ class BlazeServer final {
   // this object will be in connected state.
   bool Connect();
 
+  // Human-readable reason the most recent Connect() failed (empty if it
+  // succeeded or was never called).
+  const std::string &ConnectError() const { return connect_error_; }
+
   // Send the command line to the server and forward whatever it says to stdout
   // and stderr. Returns the desired exit code. Only call this when the server
   // is in connected state.
@@ -255,6 +259,8 @@ class BlazeServer final {
   std::string request_cookie_;
   std::string response_cookie_;
   std::string command_id_;
+  // Human-readable reason the most recent Connect() failed (empty on success).
+  std::string connect_error_;
 
   // protects command_id_ . Although we always set it before making the cancel
   // thread do something with it, the mutex is still useful because it provides
@@ -1233,17 +1239,29 @@ static ATTRIBUTE_NORETURN void RunClientServerMode(
     const std::optional<DurationMillis> extract_data_duration,
     const std::optional<DurationMillis> command_wait_duration,
     BlazeServer *server, StartupInterceptor *interceptor,
-    const string &build_label) {
+    const string &build_label, const string &install_md5) {
   while (true) {
     if (!server->Connected()) {
       // In CRIU mode, if no server is running but a checkpoint exists, restore
       // the warm server instead of cold-starting one, so the user transparently
       // reattaches to their saved server. Best-effort: on failure we fall
       // through to a normal (cold) namespaced start below.
-      if (CriuModeActive() && CriuCheckpointExists(startup_options.output_base)) {
+      // install_md5 identifies this binary; CriuCheckpointExists uses it to
+      // reject a checkpoint taken by a different binary, so we cold-start the
+      // new binary instead of reviving a stale server image.
+      if (CriuModeActive() &&
+          CriuCheckpointExists(startup_options.output_base, install_md5)) {
         BAZEL_LOG(USER) << "No server running; restoring CRIU checkpoint.";
         if (CriuRestore(startup_options.output_base)) {
-          server->Connect();
+          if (!server->Connect()) {
+            // The restore reported success but we cannot talk to the revived
+            // server. Cold-starting now discards the warm server, so surface
+            // exactly why the connect failed before falling back.
+            BAZEL_LOG(USER)
+                << "criu: restored server is unreachable ("
+                << server->ConnectError()
+                << "); cold-starting a fresh server instead.";
+          }
         }
       }
       if (!server->Connected()) {
@@ -1693,7 +1711,8 @@ static void RunLauncher(const string& self_path,
     RunClientServerMode(
         server_exe, server_exe_args, server_dir, workspace_layout, workspace,
         option_processor, startup_options, logging_info, extract_data_duration,
-        command_wait_duration, blaze_server, interceptor, build_label);
+        command_wait_duration, blaze_server, interceptor, build_label,
+        install_md5);
   }
 }
 
@@ -1806,7 +1825,7 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
   // it asks the in-namespace init serving this output_base to `criu dump` the
   // running server, then exits. Resolving output_base above is all we need.
   if (CriuCheckpointRequested()) {
-    return CriuCheckpoint(startup_options->output_base);
+    return CriuCheckpoint(startup_options->output_base, install_md5);
   }
 
   RunLauncher(self_path, archive_contents, install_md5, *startup_options,
@@ -1849,8 +1868,14 @@ bool BlazeServer::TryConnect(CommandServer::Stub *client) {
   grpc::Status status = client->Ping(&context, request, &response);
 
   if (!status.ok() || response.cookie() != response_cookie_) {
-    BAZEL_LOG(INFO) << "Connection to server failed: (" << status.error_code()
-                    << ") " << status.error_message().c_str() << "\n";
+    if (!status.ok()) {
+      connect_error_ = "gRPC ping failed (" +
+                       blaze_util::ToString(status.error_code()) + ") " +
+                       status.error_message();
+    } else {
+      connect_error_ = "gRPC ping returned a mismatched response cookie";
+    }
+    BAZEL_LOG(INFO) << "Connection to server failed: " << connect_error_;
     return false;
   }
 
@@ -1859,14 +1884,21 @@ bool BlazeServer::TryConnect(CommandServer::Stub *client) {
 
 bool BlazeServer::Connect() {
   assert(!Connected());
+  connect_error_.clear();
 
   blaze_util::Path server_dir = output_base_.GetRelative("server");
 
   command_server::ServerInfo server_info;
   std::string bytes;
   if (!blaze_util::ReadFile(server_dir.GetRelative("server_info.rawproto"),
-                            &bytes) ||
-      !server_info.ParseFromString(bytes)) {
+                            &bytes)) {
+    connect_error_ = "cannot read server/server_info.rawproto";
+    BAZEL_LOG(INFO) << "Could not connect to server: " << connect_error_;
+    return false;
+  }
+  if (!server_info.ParseFromString(bytes)) {
+    connect_error_ = "server/server_info.rawproto is not a valid ServerInfo";
+    BAZEL_LOG(INFO) << "Could not connect to server: " << connect_error_;
     return false;
   }
 
@@ -1879,6 +1911,8 @@ bool BlazeServer::Connect() {
   if (port.compare(0, ipv4_prefix.size(), ipv4_prefix) &&
       port.compare(0, ipv6_prefix_1.size(), ipv6_prefix_1) &&
       port.compare(0, ipv6_prefix_2.size(), ipv6_prefix_2)) {
+    connect_error_ = "server address '" + port + "' is not on localhost";
+    BAZEL_LOG(INFO) << "Could not connect to server: " << connect_error_;
     return false;
   }
 
@@ -1887,10 +1921,16 @@ bool BlazeServer::Connect() {
 
   const pid_t server_pid = server_info.pid();
   if (server_pid < 0) {
+    connect_error_ = "server_info.rawproto has no valid pid";
+    BAZEL_LOG(INFO) << "Could not connect to server: " << connect_error_;
     return false;
   }
 
   if (!VerifyServerProcess(server_pid, output_base_)) {
+    connect_error_ = "no live server process at pid " +
+                     blaze_util::ToString(server_pid) +
+                     " (VerifyServerProcess failed)";
+    BAZEL_LOG(INFO) << "Could not connect to server: " << connect_error_;
     return false;
   }
 
@@ -1904,6 +1944,9 @@ bool BlazeServer::Connect() {
   std::unique_ptr<CommandServer::Stub> client(CommandServer::NewStub(channel));
 
   if (!TryConnect(client.get())) {
+    // TryConnect set connect_error_ with the gRPC status detail.
+    BAZEL_LOG(INFO) << "Could not connect to server at " << port << ": "
+                    << connect_error_;
     return false;
   }
 
