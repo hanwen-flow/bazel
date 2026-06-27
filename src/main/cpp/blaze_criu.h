@@ -65,13 +65,21 @@ bool CriuCheckpointRequested();
 // Asks the in-namespace init serving output_base's control socket to checkpoint
 // the running server into $output_base/criu/ (criu dump, rootless, from inside
 // the namespace). If BAZEL_CRIU_CHECKPOINT=stop, the server is also torn down
-// after the dump. Returns a process exit code (0 on success). Prints progress
-// and any error to stderr.
-int CriuCheckpoint(const blaze_util::Path &output_base);
+// after the dump. `install_md5` identifies the binary that produced the server
+// (it is the install_base's basename); it is recorded alongside the images so a
+// later restore can reject a checkpoint taken by a different binary. Returns a
+// process exit code (0 on success). Prints progress and any error to stderr.
+int CriuCheckpoint(const blaze_util::Path &output_base,
+                   const std::string &install_md5);
 
-// Returns true if a usable CRIU checkpoint exists for output_base, i.e. the
-// images dir contains the recorded namespace-local pid that restore needs.
-bool CriuCheckpointExists(const blaze_util::Path &output_base);
+// Returns true if a usable CRIU checkpoint exists for output_base AND it was
+// taken by the binary identified by `install_md5` (the install_base basename):
+// the images dir must contain the recorded namespace-local pid that restore
+// needs, and its recorded install key must match. A checkpoint from a different
+// binary is treated as absent, so the launcher cold-starts the new binary
+// rather than reviving a stale server.
+bool CriuCheckpointExists(const blaze_util::Path &output_base,
+                          const std::string &install_md5);
 
 // Starts the bazel server inside a fresh user+PID+mount namespace, mirroring
 // the contract of ExecuteDaemon: it spawns `exe args_vector` via the daemonize

@@ -31,6 +31,18 @@ cc_test(
 )
 
 cc_test(
+    name = "blaze_criu_test",
+    size = "small",
+    srcs = ["blaze_criu_test.cc"],
+    deps = [
+        "//src/main/cpp:blaze_util",
+        "//src/main/cpp/util:filesystem",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "option_processor_test",
     size = "small",
     srcs = ["option_processor_test.cc"],
