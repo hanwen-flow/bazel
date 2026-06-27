@@ -1353,6 +1353,30 @@ bool CriuRestore(const blaze_util::Path &output_base) {
   BAZEL_LOG(USER) << "Restoring server (ns pid " << ns_pid << ") from "
                   << images_dir.AsPrintablePath() << " ...";
 
+  // Recreate server.pid.txt holding the server's namespace-local pid BEFORE the
+  // restore runs, so the file is in place the instant the JVM resumes. The
+  // restored server runs a PidFileWatcher that re-reads this file on a fixed
+  // ~3s schedule and `halt()`s the process the moment it finds the file missing
+  // or holding a pid other than its own (it assumes another server clobbered
+  // it). A graceful `bazel shutdown` between checkpoints deletes this file on
+  // its way out (ShutdownHooks.cleanupPidFile). Crucially, criu restores the
+  // JVM's monotonic clock and the watcher's scheduled-timer state as they were
+  // at checkpoint time, but wall/monotonic time has jumped forward across the
+  // checkpoint->restore gap, so the watcher's task is overdue and fires almost
+  // immediately on resume -- before any post-restore write from out here could
+  // land. So the file must already exist when criu resumes the process, not be
+  // written afterwards. The watcher's expected pid is the *namespace-local* pid
+  // (the value the server saw for itself at checkpoint time, which criu
+  // preserves across restore), NOT the host pid we later patch into the rawproto
+  // for the client. A `criu dump`/SIGKILL teardown leaves this file intact, so
+  // rewriting it to the same ns_pid is harmless there.
+  const blaze_util::Path pid_file = server_dir.GetRelative(kServerPidFile);
+  if (!blaze_util::MakeDirectories(server_dir, 0755) ||
+      !blaze_util::WriteFile(std::to_string(ns_pid) + "\n", pid_file)) {
+    BAZEL_LOG(USER) << "criu: could not write " << pid_file.AsPrintablePath();
+    return false;
+  }
+
   // criu restore runs as the foreground command of a fresh namespace; the init
   // adopts the --restore-detached tree and then persists, holding the namespace
   // open exactly as a fresh namespaced start would.
