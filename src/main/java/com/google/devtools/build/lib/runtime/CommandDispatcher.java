@@ -59,6 +59,7 @@ public interface CommandDispatcher {
       Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
       Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
       List<Any> commandExtensions,
+      int clientSeenServerPid,
       CommandExtensionReporter commandExtensionReporter)
       throws InterruptedException;
 
@@ -79,6 +80,7 @@ public interface CommandDispatcher {
       Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
       Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
       List<Any> commandExtensions,
+      int clientSeenServerPid,
       CommandExtensionReporter commandExtensionReporter,
       TerminalSizeMonitor terminalSizeMonitor)
       throws InterruptedException {
@@ -93,6 +95,7 @@ public interface CommandDispatcher {
         startupOptionsTaggedWithBazelRc,
         idleTaskResultsSupplier,
         commandExtensions,
+        clientSeenServerPid,
         commandExtensionReporter);
   }
 }

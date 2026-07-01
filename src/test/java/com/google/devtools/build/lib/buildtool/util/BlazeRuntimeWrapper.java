@@ -241,6 +241,7 @@ public class BlazeRuntimeWrapper {
                 /* idleTaskResultsFromPreviousIdlePeriod= */ ImmutableList.of(),
                 this.crashMessages::add,
                 extensions.stream().map(Any::pack).collect(toImmutableList()),
+                /* clientSeenServerPid= */ 0,
                 NO_OP_COMMAND_EXTENSION_REPORTER,
                 /* attemptNumber= */ 1,
                 /* buildRequestIdOverride= */ null,

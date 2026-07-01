@@ -72,6 +72,13 @@ message RunRequest {
   // arbitrary messages which the server may be programmed to recognize and
   // consume. Unrecognized message types are ignored.
   repeated google.protobuf.Any command_extensions = 8;
+
+  // The server's process id as seen by the client on the host. The server
+  // cannot always observe this itself: under CRIU checkpoint/restore it runs in
+  // a PID namespace, so ProcessHandle.current().pid() reports a small
+  // namespace-local pid, while the client connects to (and this field carries)
+  // the host pid. Unset (0) when the client does not know it, e.g. batch mode.
+  int32 client_seen_server_pid = 10;
 }
 
 // Contains the a startup option with its source file. Uses bytes to preserve
