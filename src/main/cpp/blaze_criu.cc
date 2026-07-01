@@ -74,14 +74,6 @@ bool CriuModeActive() {
 #endif
 }
 
-bool CriuCheckpointRequested() {
-#ifdef __linux__
-  return ExistsEnv("BAZEL_CRIU_CHECKPOINT");
-#else
-  return false;
-#endif
-}
-
 bool CriuCheckpointExists(const blaze_util::Path &output_base,
                           const std::string &install_md5) {
   const blaze_util::Path images = output_base.GetRelative(kCriuImagesSubdir);
@@ -122,7 +114,7 @@ int ExecuteDaemonInNamespace(const blaze_util::Path &, const vector<string> &,
 
 bool CriuRestore(const blaze_util::Path &) { return false; }
 
-int CriuCheckpoint(const blaze_util::Path &, const std::string &) {
+int CriuCheckpoint(const blaze_util::Path &, const std::string &, bool) {
   BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
       << "BAZEL_CRIU is only supported on Linux.";
   return -1;
@@ -1464,9 +1456,8 @@ bool CriuRestore(const blaze_util::Path &output_base) {
 }
 
 int CriuCheckpoint(const blaze_util::Path &output_base,
-                   const std::string &install_md5) {
-  // BAZEL_CRIU_CHECKPOINT=stop means dump and then tear the server down.
-  const bool stop = GetEnv("BAZEL_CRIU_CHECKPOINT") == "stop";
+                   const std::string &install_md5, bool stop) {
+  // `stop` means dump and then tear the server down.
   const string cmd = stop ? "CHECKPOINT_STOP" : "CHECKPOINT";
 
   const blaze_util::Path images_dir =
