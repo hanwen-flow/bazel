@@ -84,11 +84,12 @@ In this mode the launcher:
 
 Checkpoints are taken from *inside* the namespace: the persistent init serves a
 control socket at `{{ '<var>' }}output_base{{ '</var>' }}/bazel-criu.sock`, and
-an invocation with `BAZEL_CRIU_CHECKPOINT` set asks it to run `criu dump`. Since
-the init holds `CAP_CHECKPOINT_RESTORE` over its own user namespace, the dump is
-**rootless** — no `sudo`, the images are owned by the invoking user, and the
-host's inherited snap/squashfs/FUSE mounts need no special handling. Set
-`BAZEL_CRIU_CHECKPOINT=stop` to also tear the server down after dumping.
+the `checkpoint` command (run with `BAZEL_CRIU` set) asks it to run `criu dump`.
+Since the init holds `CAP_CHECKPOINT_RESTORE` over its own user namespace, the
+dump is **rootless** — no `sudo`, the images are owned by the invoking user, and
+the host's inherited snap/squashfs/FUSE mounts need no special handling. By
+default `checkpoint` tears the server down after dumping; pass `--leave_running`
+to keep the warm server up.
 
 This requires a Linux kernel with unprivileged user namespaces enabled, `criu`
 on `$PATH` (override with `BAZEL_CRIU_BINARY`), and the `JniLoader` JNI-extract

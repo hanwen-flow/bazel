@@ -1821,11 +1821,30 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
 
   MaybeConfigureCriuMode(startup_options);
 
-  // A checkpoint request (BAZEL_CRIU_CHECKPOINT) does not run a bazel command:
-  // it asks the in-namespace init serving this output_base to `criu dump` the
-  // running server, then exits. Resolving output_base above is all we need.
-  if (CriuCheckpointRequested()) {
-    return CriuCheckpoint(startup_options->output_base, install_md5);
+  // The `checkpoint` command does not run a bazel command: it asks the
+  // in-namespace init serving this output_base to `criu dump` the running
+  // server, then exits. It is only meaningful when CRIU mode is active (BAZEL_CRIU
+  // set); resolving output_base above is all it needs. By default it tears the
+  // server down after the dump; `--leave_running` keeps the warm server up.
+  if ("checkpoint" == option_processor->GetCommand()) {
+    if (!CriuModeActive()) {
+      BAZEL_LOG(USER) << "The 'checkpoint' command requires CRIU mode "
+                         "(set the BAZEL_CRIU environment variable).";
+      return blaze_exit_code::BAD_ARGV;
+    }
+    bool stop = true;
+    for (const string &arg : option_processor->GetExplicitCommandArguments()) {
+      if (arg == "--leave_running" || arg == "--leave_running=true") {
+        stop = false;
+      } else if (arg == "--noleave_running" || arg == "--leave_running=false") {
+        stop = true;
+      } else {
+        BAZEL_LOG(USER) << "Unknown argument to 'checkpoint': " << arg
+                        << " (accepts --[no]leave_running).";
+        return blaze_exit_code::BAD_ARGV;
+      }
+    }
+    return CriuCheckpoint(startup_options->output_base, install_md5, stop);
   }
 
   RunLauncher(self_path, archive_contents, install_md5, *startup_options,

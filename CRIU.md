@@ -25,13 +25,12 @@ When `BAZEL_CRIU` is set, the launcher:
   attaches, and skips the `/proc` start-time check.
 
 The persistent init also serves a small **checkpoint control socket** at
-`$output_base/bazel-criu.sock`. A separate invocation with
-`BAZEL_CRIU_CHECKPOINT` set asks that init to run `criu dump` from *inside* the
-namespace — where the init holds `CAP_CHECKPOINT_RESTORE` over its own user
-namespace and CRIU sees a self-consistent mount view. That is what makes the
-dump succeed **rootless** (no `sudo`), with the images owned by your user (no
-`chown`), and without having to special-case the host's inherited
-snap/squashfs/FUSE mounts.
+`$output_base/bazel-criu.sock`. A separate `checkpoint` invocation asks that
+init to run `criu dump` from *inside* the namespace — where the init holds
+`CAP_CHECKPOINT_RESTORE` over its own user namespace and CRIU sees a
+self-consistent mount view. That is what makes the dump succeed **rootless** (no
+`sudo`), with the images owned by your user (no `chown`), and without having to
+special-case the host's inherited snap/squashfs/FUSE mounts.
 
 ## Prerequisites
 
@@ -124,24 +123,27 @@ BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" info server_pid   # same pid, instant
 ## 3. Take a checkpoint
 
 The launcher takes the checkpoint for you, rootless, by asking the in-namespace
-init to run `criu dump`. Just run an invocation with `BAZEL_CRIU_CHECKPOINT`
-set — any command works; the checkpoint request short-circuits before the
-command runs:
+init to run `criu dump`. Run the `checkpoint` command; it short-circuits in the
+launcher (it never reaches the server as a normal command):
 
 ```sh
-BAZEL_CRIU=1 BAZEL_CRIU_CHECKPOINT=1 "$BAZEL" --output_base="$OB" info
-# => criu: requesting checkpoint -> .../criu
-# => criu: checkpointed
-```
-
-This dumps the server **and leaves it running** (`--leave-running`). To dump and
-then tear the server down (e.g. to free the machine before snapshotting it),
-set `BAZEL_CRIU_CHECKPOINT=stop`:
-
-```sh
-BAZEL_CRIU=1 BAZEL_CRIU_CHECKPOINT=stop "$BAZEL" --output_base="$OB" info
+BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" checkpoint
+# => criu: requesting checkpoint+stop -> .../criu
 # => criu: checkpointed and stopped   (the server and its namespace are gone)
 ```
+
+By default `checkpoint` dumps the server **and then tears it down** (e.g. to
+free the machine before snapshotting it). To dump but leave the warm server
+running (`--leave-running`), pass `--leave_running`:
+
+```sh
+BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" checkpoint --leave_running
+# => criu: requesting checkpoint -> .../criu
+# => criu: checkpointed          (the server is still up and reattachable)
+```
+
+The `checkpoint` command requires CRIU mode; run it with `BAZEL_CRIU` set, as
+above. (It replaces the older `BAZEL_CRIU_CHECKPOINT` environment variable.)
 
 The dump runs inside the namespace, so:
 
@@ -190,7 +192,7 @@ pkill -f -- "--output_base=$OB"          # the server and its persisted init
 pgrep -af -- "--output_base=$OB"         # should be empty now
 ```
 
-(Alternatively, `BAZEL_CRIU_CHECKPOINT=stop` from step 3 dumps *and* tears the
+(Alternatively, the plain `checkpoint` command from step 3 dumps *and* tears the
 server down in one step.)
 
 The image and `ns-pid` file are still on disk under `$OB/criu/`. The next
