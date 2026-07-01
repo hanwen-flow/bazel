@@ -514,6 +514,7 @@ public class CommandServer implements GrpcCommandServer.Callback {
                 Optional.of(startupOptions.build()),
                 commandManager::getIdleTaskResults,
                 request.getCommandExtensionsList(),
+                request.getClientSeenServerPid(),
                 new RpcCommandExtensionReporter(command.getId(), responseCookie, responder));
       } catch (OptionsParsingException e) {
         rpcOutErr.printErrLn(e.getMessage());

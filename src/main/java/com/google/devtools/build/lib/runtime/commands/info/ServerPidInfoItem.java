@@ -28,6 +28,11 @@ public final class ServerPidInfoItem extends InfoItem {
   @Override
   public byte[] get(
       Supplier<BuildConfigurationValue> configurationSupplier, CommandEnvironment env) {
-    return print(ProcessHandle.current().pid());
+    // Prefer the pid the client used to reach us on the host. It differs from our own
+    // ProcessHandle pid when we run in a PID namespace under CRIU checkpoint/restore, where our
+    // own view is only the namespace-local pid. Fall back to our own pid when the client did not
+    // report one (e.g. batch mode).
+    int clientSeenServerPid = env.getClientSeenServerPid();
+    return print(clientSeenServerPid > 0 ? clientSeenServerPid : ProcessHandle.current().pid());
   }
 }

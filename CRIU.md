@@ -85,10 +85,17 @@ cd ~/my/workspace        # any dir under a MODULE.bazel / WORKSPACE
 BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" info server_pid	
 ```
 
-The reported `server_pid` is the server's **namespace-local** pid — it will be a
-small number (e.g. `7`), not a host pid. Confirm the server really lives in a
-PID namespace. Both the persisted init and the server carry `--output_base=$OB`
-on their command line, which is the most robust thing to match on (the server's
+The reported `server_pid` is the server's **host** pid, not its namespace-local
+one. The server itself only sees its small namespace-local pid (e.g. `7`) via
+`ProcessHandle`; the client, however, connects over the host pid (the launcher
+stamps it into `server_info.rawproto`) and passes it into each request, and the
+`server_pid` info item echoes that back. So `info server_pid` matches the pid
+you see for the `java` process on the host — even across a restore, when the
+host pid changes but the namespace-local pid does not.
+
+To confirm the server really lives in a PID namespace, inspect `/proc`
+directly. Both the persisted init and the server carry `--output_base=$OB` on
+their command line, which is the most robust thing to match on (the server's
 `argv[0]` is `bazel(<workspace>)`, with parentheses that confuse `pgrep -f`
 regexes):
 
@@ -194,7 +201,9 @@ and reattach to the revived server — you will see a
 
 ```sh
 BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" info server_pid
-# restores, then prints the original (namespace-local) server_pid
+# restores, then prints the revived server's host pid -- the same <N> as in the
+# "Restored; server reachable at host pid <N>" line above (a new host pid, since
+# restore re-creates the process; the namespace-local pid is unchanged)
 
 BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" build //...
 # runs against the restored warm server; analysis cache is hot

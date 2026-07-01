@@ -58,6 +58,7 @@ public interface CommandDispatcher {
       Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
       Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
       List<Any> commandExtensions,
+      int clientSeenServerPid,
       CommandExtensionReporter commandExtensionReporter)
       throws InterruptedException;
 }

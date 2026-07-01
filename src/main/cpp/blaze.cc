@@ -2144,6 +2144,10 @@ unsigned int BlazeServer::Communicate(
   request.set_quiet(quiet_);
   request.set_preemptible(preemptible_);
   request.set_client_description("pid=" + blaze::GetProcessIdAsString());
+  // Tell the server the pid the client used to reach it. This is the host pid
+  // even when the server runs in a CRIU PID namespace (where the server would
+  // otherwise only see its small namespace-local pid); see ServerInfo.pid.
+  request.set_client_seen_server_pid(process_info_.server_pid_);
   for (const string &arg : arg_vector) {
     request.add_arg(arg);
   }
