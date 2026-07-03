@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // blaze_criu folds the experimental "horapha" CRIU wrapper into the launcher
-// itself: when the BAZEL_CRIU environment variable is set, the launcher starts
-// the bazel server inside a fresh user+PID+mount namespace under a tiny
+// itself: when the --criu startup option is set, the launcher
+// starts the bazel server inside a fresh user+PID+mount namespace under a tiny
 // persistent init, and transparently restores a previously-saved CRIU
 // checkpoint from $output_base/criu/ when no server is running.
 //
@@ -31,8 +31,8 @@
 // unprivileged dump succeed without root, without a chown, and without having
 // to special-case the host's inherited snap/squashfs/FUSE mounts.
 //
-// Everything here is a no-op on non-Linux platforms and whenever BAZEL_CRIU is
-// unset, so the normal launcher behavior is unchanged.
+// Everything here is a no-op on non-Linux platforms and whenever
+// --criu is unset, so the normal launcher behavior is unchanged.
 
 #ifndef BAZEL_SRC_MAIN_CPP_BLAZE_CRIU_H_
 #define BAZEL_SRC_MAIN_CPP_BLAZE_CRIU_H_
@@ -47,9 +47,16 @@
 
 namespace blaze {
 
+// Records whether the launcher-driven CRIU checkpoint/restore mode is active,
+// as requested by the --criu startup option. Called once, right
+// after startup options are parsed, before any CriuModeActive() query. The
+// value is process-global because CriuModeActive() is consulted from platform
+// code (e.g. VerifyServerProcess) that has no access to StartupOptions.
+void SetCriuModeActive(bool active);
+
 // Returns true if launcher-driven CRIU checkpoint/restore is active, i.e. the
-// BAZEL_CRIU environment variable is set and we are on a platform that supports
-// it (Linux). When active the launcher:
+// --criu startup option was set and we are on a platform that
+// supports it (Linux). When active the launcher:
 //   - forces --max_idle_secs=0 so the warm server never self-terminates;
 //   - starts the server inside a PID namespace under a persistent init;
 //   - auto-restores $output_base/criu/ before starting a fresh server;

@@ -3,16 +3,16 @@
 This is an **experimental** mode (Linux only) in which the Bazel launcher starts
 the server inside a user + PID + mount namespace and transparently checkpoints
 and restores a [CRIU](https://criu.org) checkpoint of a warm server under
-`$output_base/criu/`. It is enabled by setting the `BAZEL_CRIU` environment
-variable. See the implementation in `src/main/cpp/blaze_criu.{h,cc}` and the
-overview in [`site/en/run/client-server.md`](site/en/run/client-server.md).
+`$output_base/criu/`. It is enabled by passing the `--criu`
+startup option. See the implementation in `src/main/cpp/blaze_criu.{h,cc}` and
+the overview in [`site/en/run/client-server.md`](site/en/run/client-server.md).
 
 This document explains how to build it and exercise the full
 start → checkpoint → restore cycle by hand.
 
 ## What the launcher does
 
-When `BAZEL_CRIU` is set, the launcher:
+When `--criu` is set, the launcher:
 
 * starts the server in a fresh user+PID+mount namespace under a small
   persistent init, so the process tree has reproducible low PIDs that rootless
@@ -81,7 +81,7 @@ cd ~/my/workspace        # any dir under a MODULE.bazel / WORKSPACE
 ## 2. Start a namespaced server
 
 ```sh
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" info server_pid	
+"$BAZEL" --criu --output_base="$OB" info server_pid	
 ```
 
 The reported `server_pid` is the server's **host** pid, not its namespace-local
@@ -116,8 +116,8 @@ Run a build to warm the server, and confirm a second invocation reattaches
 instead of restarting (it should not print "Starting local ... server"):
 
 ```sh
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" build //...
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" info server_pid   # same pid, instant
+"$BAZEL" --criu --output_base="$OB" build //...
+"$BAZEL" --criu --output_base="$OB" info server_pid   # same pid, instant
 ```
 
 ## 3. Take a checkpoint
@@ -127,7 +127,7 @@ init to run `criu dump`. Run the `checkpoint` command; it short-circuits in the
 launcher (it never reaches the server as a normal command):
 
 ```sh
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" checkpoint
+"$BAZEL" --criu --output_base="$OB" checkpoint
 # => criu: requesting checkpoint+stop -> .../criu
 # => criu: checkpointed and stopped   (the server and its namespace are gone)
 ```
@@ -137,13 +137,14 @@ free the machine before snapshotting it). To dump but leave the warm server
 running (`--leave-running`), pass `--leave_running`:
 
 ```sh
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" checkpoint --leave_running
+"$BAZEL" --criu --output_base="$OB" checkpoint --leave_running
 # => criu: requesting checkpoint -> .../criu
 # => criu: checkpointed          (the server is still up and reattachable)
 ```
 
-The `checkpoint` command requires CRIU mode; run it with `BAZEL_CRIU` set, as
-above. (It replaces the older `BAZEL_CRIU_CHECKPOINT` environment variable.)
+The `checkpoint` command requires CRIU mode; run it with `--criu`
+set, as above. (It replaces the older `BAZEL_CRIU_CHECKPOINT` environment
+variable.)
 
 The dump runs inside the namespace, so:
 
@@ -179,7 +180,8 @@ Common causes:
   `io.netty.native.deleteLibAfterLoading=false`), and that the libs are present
   under `$OB/jni/`.
 * `criu: no namespaced server is serving the control socket` — there is no warm
-  `BAZEL_CRIU` server for this `--output_base`; start one first (step 2).
+  `--criu` server for this `--output_base`; start one first
+  (step 2).
 
 ## 4. Tear the server down, then auto-restore
 
@@ -202,12 +204,12 @@ and reattach to the revived server — you will see a
 `Restored; server reachable at host pid <N>`:
 
 ```sh
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" info server_pid
+"$BAZEL" --criu --output_base="$OB" info server_pid
 # restores, then prints the revived server's host pid -- the same <N> as in the
 # "Restored; server reachable at host pid <N>" line above (a new host pid, since
 # restore re-creates the process; the namespace-local pid is unchanged)
 
-BAZEL_CRIU=1 "$BAZEL" --output_base="$OB" build //...
+"$BAZEL" --criu --output_base="$OB" build //...
 # runs against the restored warm server; analysis cache is hot
 ```
 

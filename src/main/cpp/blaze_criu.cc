@@ -66,9 +66,18 @@ constexpr char kControlSockName[] = "bazel-criu.sock";
 constexpr char kInstallKeyFile[] = "install-key";
 }  // namespace
 
+namespace {
+// Whether --criu was set. Populated once by SetCriuModeActive
+// after startup options are parsed; read by CriuModeActive from anywhere,
+// including platform code that has no StartupOptions in hand.
+bool g_criu_mode_active = false;
+}  // namespace
+
+void SetCriuModeActive(bool active) { g_criu_mode_active = active; }
+
 bool CriuModeActive() {
 #ifdef __linux__
-  return ExistsEnv("BAZEL_CRIU");
+  return g_criu_mode_active;
 #else
   return false;
 #endif
@@ -108,7 +117,7 @@ int ExecuteDaemonInNamespace(const blaze_util::Path &, const vector<string> &,
                              const blaze_util::Path &, const blaze_util::Path &,
                              BlazeServerStartup **) {
   BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
-      << "BAZEL_CRIU is only supported on Linux.";
+      << "CRIU mode is only supported on Linux.";
   return -1;
 }
 
@@ -116,7 +125,7 @@ bool CriuRestore(const blaze_util::Path &) { return false; }
 
 int CriuCheckpoint(const blaze_util::Path &, const std::string &, bool) {
   BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
-      << "BAZEL_CRIU is only supported on Linux.";
+      << "CRIU mode is only supported on Linux.";
   return -1;
 }
 
@@ -1471,7 +1480,7 @@ int CriuCheckpoint(const blaze_util::Path &output_base,
     BAZEL_LOG(USER)
         << "criu: no namespaced server is serving the control socket at "
         << ControlSocketPath(output_base).AsPrintablePath()
-        << " (is a BAZEL_CRIU server running?).";
+        << " (is a --criu server running?).";
     return 1;
   }
   // Responses are "OK <msg>" / "ERR <msg>".

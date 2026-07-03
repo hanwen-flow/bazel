@@ -287,6 +287,11 @@ class StartupOptions {
   // If enabled, the Bazel server will be run with systemd-run, and the user
   // will own the cgroup.
   bool run_in_user_cgroup;
+
+  // If enabled, the launcher starts (or restores) the Bazel server under CRIU
+  // checkpoint/restore control. This is a launcher-only option: it is swallowed
+  // by the launcher and never forwarded to the server. See blaze_criu.h.
+  bool criu;
 #endif
 
   // Whether to create symbolic links on Windows for files. Requires
