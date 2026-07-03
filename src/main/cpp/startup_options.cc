@@ -100,6 +100,7 @@ StartupOptions::StartupOptions(const string& product_name,
 #ifdef __linux__
       cgroup_parent(),
       run_in_user_cgroup(false),
+      criu(false),
 #endif
       windows_enable_symlinks(false),
       remote_repo_contents_cache(false),
@@ -144,6 +145,7 @@ StartupOptions::StartupOptions(const string& product_name,
 #ifdef __linux__
   RegisterNullaryStartupFlag("experimental_run_in_user_cgroup",
                              &run_in_user_cgroup);
+  RegisterNullaryStartupFlag("criu", &criu);
 #endif
   RegisterUnaryStartupFlag("command_port");
   RegisterUnaryStartupFlag("connect_timeout_secs");

@@ -60,7 +60,7 @@ versioning.
 
 ## Experimental: CRIU checkpoint/restore {:#criu}
 
-When the `BAZEL_CRIU` environment variable is set (Linux only), the launcher
+When the `--criu` startup option is set (Linux only), the launcher
 starts the server inside a fresh user + PID + mount namespace under a small
 persistent init process, and transparently checkpoints and restores a
 [CRIU](https://criu.org) checkpoint under `{{ '<var>' }}output_base{{ '</var>'
@@ -84,7 +84,8 @@ In this mode the launcher:
 
 Checkpoints are taken from *inside* the namespace: the persistent init serves a
 control socket at `{{ '<var>' }}output_base{{ '</var>' }}/bazel-criu.sock`, and
-the `checkpoint` command (run with `BAZEL_CRIU` set) asks it to run `criu dump`.
+the `checkpoint` command (run with `--criu` set) asks it to run
+`criu dump`.
 Since the init holds `CAP_CHECKPOINT_RESTORE` over its own user namespace, the
 dump is **rootless** — no `sudo`, the images are owned by the invoking user, and
 the host's inherited snap/squashfs/FUSE mounts need no special handling. By

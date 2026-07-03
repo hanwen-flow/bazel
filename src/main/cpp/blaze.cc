@@ -1357,7 +1357,7 @@ static bool HasHostJvmProperty(const vector<string> &host_jvm_args,
   return false;
 }
 
-// When BAZEL_CRIU is active, adjust startup options and environment so the
+// When CRIU mode is active, adjust startup options and environment so the
 // server we (re)start is checkpointable and never self-terminates:
 //   - --max_idle_secs=0: a warm, snapshot-worthy server must not idle out.
 //   - -Duser.home: the server runs as uid 0 inside the user namespace, so the
@@ -1782,6 +1782,13 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
   StartupOptions *startup_options = option_processor->GetParsedStartupOptions();
   startup_options->MaybeLogStartupOptionWarnings();
 
+  // Latch CRIU mode from the parsed --criu option so the free
+  // function CriuModeActive() reflects it everywhere, including platform code
+  // that has no StartupOptions in hand. Must precede any CriuModeActive() query.
+#ifdef __linux__
+  SetCriuModeActive(startup_options->criu);
+#endif
+
   if (startup_options->client_debug) {
     SetDebugLog(blaze_util::LOGGINGDETAIL_DEBUG);
   } else if (startup_options->quiet) {
@@ -1823,13 +1830,14 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
 
   // The `checkpoint` command does not run a bazel command: it asks the
   // in-namespace init serving this output_base to `criu dump` the running
-  // server, then exits. It is only meaningful when CRIU mode is active (BAZEL_CRIU
-  // set); resolving output_base above is all it needs. By default it tears the
-  // server down after the dump; `--leave_running` keeps the warm server up.
+  // server, then exits. It is only meaningful when CRIU mode is active
+  // (--criu set); resolving output_base above is all it needs. By
+  // default it tears the server down after the dump; `--leave_running` keeps the
+  // warm server up.
   if ("checkpoint" == option_processor->GetCommand()) {
     if (!CriuModeActive()) {
       BAZEL_LOG(USER) << "The 'checkpoint' command requires CRIU mode "
-                         "(set the BAZEL_CRIU environment variable).";
+                         "(pass the --criu startup option).";
       return blaze_exit_code::BAD_ARGV;
     }
     bool stop = true;
