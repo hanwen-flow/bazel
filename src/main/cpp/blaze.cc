@@ -1786,6 +1786,14 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
   // function CriuModeActive() reflects it everywhere, including platform code
   // that has no StartupOptions in hand. Must precede any CriuModeActive() query.
 #ifdef __linux__
+  // Enable --criu by default when the launcher is invoked under a name
+  // containing "horapha" (unless the user explicitly set --[no]criu).
+  if (!startup_options->criu &&
+      string(argv[0]).find("horapha") != string::npos) {
+    BAZEL_LOG(INFO) << "Enabling --criu by default because argv[0] ('"
+                    << argv[0] << "') contains 'horapha'.";
+    startup_options->criu = true;
+  }
   SetCriuModeActive(startup_options->criu);
 #endif
 
