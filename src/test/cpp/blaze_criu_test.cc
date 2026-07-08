@@ -74,4 +74,15 @@ TEST_F(CriuCheckpointExistsTest, IgnoresSurroundingWhitespaceInKey) {
   EXPECT_TRUE(CriuCheckpointExists(output_base_, "abc123"));
 }
 
+// CriuModeActive is false unless SetCriuModeActive(true) was called AND we are
+// on Linux; CriuPreflight is a no-op returning true while the mode is inactive.
+TEST(CriuModeTest, InactiveByDefault) {
+  SetCriuModeActive(false);
+  EXPECT_FALSE(CriuModeActive());
+
+  std::string error = "unset";
+  EXPECT_TRUE(CriuPreflight(&error));
+  EXPECT_EQ(error, "unset");  // untouched when the mode is inactive
+}
+
 }  // namespace blaze

@@ -123,6 +123,8 @@ int ExecuteDaemonInNamespace(const blaze_util::Path &, const vector<string> &,
 
 bool CriuRestore(const blaze_util::Path &) { return false; }
 
+bool CriuPreflight(std::string *) { return true; }
+
 int CriuCheckpoint(const blaze_util::Path &, const std::string &, bool) {
   BAZEL_DIE(blaze_exit_code::INTERNAL_ERROR)
       << "CRIU mode is only supported on Linux.";
@@ -1180,6 +1182,28 @@ string CriuBinary() {
   return criu.empty() ? "criu" : criu;
 }
 
+// Reads a small sysctl-style file (e.g. /proc/sys/...) and returns its trimmed
+// contents, or "" if it cannot be read (the knob is absent on this kernel).
+string ReadSysctl(const char *path) {
+  string value;
+  if (!blaze_util::ReadFile(path, &value)) {
+    return "";
+  }
+  return Stripped(value);
+}
+
+// Resolves the criu binary to an absolute, executable path for the preflight
+// report. If BAZEL_CRIU_BINARY is set it is taken as-is (it may be absolute);
+// otherwise the bare "criu" is looked up on PATH exactly as execvpe would at
+// dump/restore time. Returns "" if nothing usable is found.
+string ResolveCriuBinary() {
+  const string criu = CriuBinary();
+  if (criu.find('/') != string::npos) {
+    return access(criu.c_str(), X_OK) == 0 ? criu : "";
+  }
+  return Which(criu);
+}
+
 // Returns the checkpoint control socket path for an output_base.
 blaze_util::Path ControlSocketPath(const blaze_util::Path &output_base) {
   return output_base.GetRelative(kControlSockName);
@@ -1275,6 +1299,106 @@ bool ControlRequest(const blaze_util::Path &output_base, const string &cmd,
 }
 
 }  // namespace
+
+bool CriuPreflight(std::string *error) {
+  if (!CriuModeActive()) {
+    return true;
+  }
+
+  // Gather the observed state of every roadblock up front so we can both log it
+  // and, on failure, print it all together in one diagnostic.
+  const string apparmor =
+      ReadSysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns");
+  const string userns_clone =
+      ReadSysctl("/proc/sys/kernel/unprivileged_userns_clone");
+  const string max_userns = ReadSysctl("/proc/sys/user/max_user_namespaces");
+  const string criu_path = ResolveCriuBinary();
+  const string criu_requested = CriuBinary();
+
+  BAZEL_LOG(INFO) << "criu preflight:"
+                  << " apparmor_restrict_unprivileged_userns="
+                  << (apparmor.empty() ? "(absent)" : apparmor)
+                  << " unprivileged_userns_clone="
+                  << (userns_clone.empty() ? "(absent)" : userns_clone)
+                  << " max_user_namespaces="
+                  << (max_userns.empty() ? "(absent)" : max_userns)
+                  << " criu=" << (criu_path.empty() ? "(not found)" : criu_path);
+
+  vector<string> problems;
+
+  // AppArmor userns restriction (Ubuntu 23.10+): the single most common
+  // roadblock. "1" (or higher) blocks unprivileged user namespaces outright.
+  if (apparmor == "1" || apparmor == "2") {
+    problems.push_back(
+        "unprivileged user namespaces are restricted by AppArmor "
+        "(/proc/sys/kernel/apparmor_restrict_unprivileged_userns = " +
+        apparmor +
+        ").\n"
+        "  Enable them with:\n"
+        "    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0");
+  }
+
+  // Older Debian/Ubuntu knob: unprivileged_userns_clone must be 1 when present.
+  if (userns_clone == "0") {
+    problems.push_back(
+        "unprivileged user namespaces are disabled "
+        "(/proc/sys/kernel/unprivileged_userns_clone = 0).\n"
+        "  Enable them with:\n"
+        "    sudo sysctl -w kernel.unprivileged_userns_clone=1");
+  }
+
+  // A zero namespace budget also blocks the unshare(CLONE_NEWUSER).
+  if (max_userns == "0") {
+    problems.push_back(
+        "user namespace creation is disabled "
+        "(/proc/sys/user/max_user_namespaces = 0).\n"
+        "  Raise the limit with:\n"
+        "    sudo sysctl -w user.max_user_namespaces=15000");
+  }
+
+  // No usable criu binary means the dump/restore forks would fail with an
+  // opaque exec error from inside the namespace.
+  if (criu_path.empty()) {
+    if (criu_requested.find('/') != string::npos) {
+      problems.push_back("the criu binary at BAZEL_CRIU_BINARY=" +
+                         criu_requested +
+                         " is missing or not executable.");
+    } else {
+      problems.push_back(
+          "no 'criu' binary was found on PATH.\n"
+          "  Install criu (>= 3.18; 4.x recommended), or point "
+          "BAZEL_CRIU_BINARY at it.\n"
+          "  If criu lives in a non-standard dir (e.g. /usr/local/sbin), add "
+          "it to PATH.");
+    }
+  }
+
+  if (problems.empty()) {
+    return true;
+  }
+
+  string msg =
+      "CRIU mode (--criu) is not usable on this host:\n";
+  for (const string &p : problems) {
+    msg += "  - " + p + "\n";
+  }
+  msg +=
+      "Observed state:\n"
+      "  /proc/sys/kernel/apparmor_restrict_unprivileged_userns = " +
+      (apparmor.empty() ? "(absent)" : apparmor) +
+      "\n"
+      "  /proc/sys/kernel/unprivileged_userns_clone = " +
+      (userns_clone.empty() ? "(absent)" : userns_clone) +
+      "\n"
+      "  /proc/sys/user/max_user_namespaces = " +
+      (max_userns.empty() ? "(absent)" : max_userns) +
+      "\n"
+      "  criu binary = " + (criu_path.empty() ? "(not found)" : criu_path) +
+      "\n"
+      "See CRIU.md for details, or run without --criu.";
+  *error = msg;
+  return false;
+}
 
 int ExecuteDaemonInNamespace(const blaze_util::Path &exe,
                              const vector<string> &args_vector,
