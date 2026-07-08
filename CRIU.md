@@ -32,12 +32,26 @@ self-consistent mount view. That is what makes the dump succeed **rootless** (no
 `sudo`), with the images owned by your user (no `chown`), and without having to
 special-case the host's inherited snap/squashfs/FUSE mounts.
 
+Before it starts, restores, or checkpoints a namespaced server, the launcher
+runs a **preflight check** of the roadblocks below and, if any fails, exits with
+an actionable message naming the knob and the command to fix it (rather than an
+opaque `unshare`/`criu` error deep inside the namespace setup). Pass
+`--client_debug` to see the observed state of every check logged even on
+success.
+
 ## Prerequisites
 
-* A Linux kernel with **unprivileged user namespaces** enabled
-  (`sysctl kernel.unprivileged_userns_clone=1` on some distros; on most modern
-  distros it is on by default — `cat /proc/sys/kernel/unprivileged_userns_clone`
-  should print `1`).
+* A Linux kernel with **unprivileged user namespaces** enabled. Common blockers,
+  each caught by the preflight check:
+  * AppArmor's `kernel.apparmor_restrict_unprivileged_userns` (Ubuntu 23.10+).
+    If `cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns` prints `1`,
+    enable them with
+    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
+  * The older `kernel.unprivileged_userns_clone` knob on some distros
+    (`sudo sysctl -w kernel.unprivileged_userns_clone=1`); on most modern distros
+    it is on by default — `cat /proc/sys/kernel/unprivileged_userns_clone`
+    should print `1`.
+  * `user.max_user_namespaces` must be non-zero.
 * **`criu` >= 3.18** on `$PATH` (4.x recommended). Override the binary with
   `BAZEL_CRIU_BINARY`. Check capabilities with `sudo criu check`.
 * A JDK matching the one the `bazel-dev` binary was compiled for (e.g. Java 21);

@@ -1376,6 +1376,15 @@ static void MaybeConfigureCriuMode(StartupOptions *startup_options) {
     return;
   }
 
+  // Verify the host can actually run CRIU mode (unprivileged user namespaces
+  // enabled, a usable criu binary on PATH) before we try to start, restore, or
+  // checkpoint a namespaced server. Failing here with an actionable message
+  // beats an opaque unshare()/execvpe() error deep inside the namespace setup.
+  std::string preflight_error;
+  if (!CriuPreflight(&preflight_error)) {
+    BAZEL_DIE(blaze_exit_code::LOCAL_ENVIRONMENTAL_ERROR) << preflight_error;
+  }
+
   startup_options->max_idle_secs = 0;
 
   // Keep the JVM's perf-counter data in heap memory instead of an mmap'd

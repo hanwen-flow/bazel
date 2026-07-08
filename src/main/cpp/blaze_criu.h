@@ -63,6 +63,22 @@ void SetCriuModeActive(bool active);
 //   - drops the /proc starttime check in VerifyServerProcess.
 bool CriuModeActive();
 
+// Verifies that this host can actually run CRIU mode before the launcher tries
+// to start, restore, or checkpoint a namespaced server. It checks the common
+// roadblocks that otherwise surface as opaque failures deep in the namespace
+// setup or in criu:
+//   - unprivileged user namespaces disabled by AppArmor (Ubuntu 23.10+'s
+//     kernel.apparmor_restrict_unprivileged_userns), or by the older
+//     kernel.unprivileged_userns_clone / user.max_user_namespaces sysctls;
+//   - no usable `criu` binary on PATH (or at $BAZEL_CRIU_BINARY).
+//
+// Always emits the observed state of each check to the INFO log (visible with
+// --client_debug). Returns true if CRIU mode is usable. On failure returns
+// false and fills *error with a human-readable diagnostic that names the
+// roadblock, prints the state of every check, and gives the command to fix it.
+// A no-op returning true when CRIU mode is inactive or on non-Linux.
+bool CriuPreflight(std::string *error);
+
 // Asks the in-namespace init serving output_base's control socket to checkpoint
 // the running server into $output_base/criu/ (criu dump, rootless, from inside
 // the namespace). If `stop` is true, the server is also torn down after the
