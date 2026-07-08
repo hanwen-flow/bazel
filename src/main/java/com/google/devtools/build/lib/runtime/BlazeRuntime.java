@@ -1173,7 +1173,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
               Optional.of(startupOptionsFromCommandLine.build()),
               /* idleTaskResultsSupplier= */ () -> ImmutableList.of(),
               /* commandExtensions= */ ImmutableList.of(),
-              /* clientSeenServerPid= */ 0,
               /* commandExtensionReporter= */ (ext) -> {});
       if (result.getExecRequest() == null) {
         // Simple case: we are given an exit code
@@ -1283,6 +1282,7 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
               startupOptions.getCommandPort(),
               runtime.getServerDirectory(),
               serverPid,
+              startupOptions.getCriu(),
               startupOptions.getMaxIdleSeconds(),
               startupOptions.getShutdownOnLowSysMem(),
               startupOptions.getIdleServerTasks(),

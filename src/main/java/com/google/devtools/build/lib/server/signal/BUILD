@@ -14,6 +14,7 @@ filegroup(
 java_library(
     name = "signal",
     srcs = [
+        "ControlSignalHandler.java",
         "InterruptSignalHandler.java",
     ],
     deps = ["//third_party:guava"],

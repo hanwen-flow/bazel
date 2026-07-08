@@ -133,7 +133,6 @@ public class CommandEnvironment {
   private final Duration waitTime;
   private final long commandStartTime;
   private final ImmutableList<Any> commandExtensions;
-  private final int clientSeenServerPid;
   private final ImmutableList.Builder<Any> responseExtensions = ImmutableList.builder();
   private final Consumer<String> shutdownReasonConsumer;
   private final BuildResultListener buildResultListener;
@@ -245,7 +244,6 @@ public class CommandEnvironment {
       @Nullable ImmutableList<IdleTask.Result> idleTaskResultsFromPreviousIdlePeriod,
       Consumer<String> shutdownReasonConsumer,
       List<Any> commandExtensions,
-      int clientSeenServerPid,
       CommandExtensionReporter commandExtensionReporter,
       int attemptNumber,
       @Nullable String buildRequestIdOverride,
@@ -303,7 +301,6 @@ public class CommandEnvironment {
     this.waitTime = Duration.ofMillis(waitTimeInMs + commandOptions.getWaitTime());
     this.commandStartTime = commandStartTime - commandOptions.getStartupTime();
     this.commandExtensions = ImmutableList.copyOf(commandExtensions);
-    this.clientSeenServerPid = clientSeenServerPid;
     workspace.getSkyframeExecutor().setEventBus(eventBus);
     eventBus.register(this);
     float httpTimeoutScaling = (float) commandOptions.getHttpTimeoutScaling();
@@ -1092,18 +1089,6 @@ public class CommandEnvironment {
    */
   public ImmutableList<Any> getCommandExtensions() {
     return commandExtensions;
-  }
-
-  /**
-   * Returns the server's process id as seen by the client on the host, or 0 if the client did not
-   * report it (e.g. batch mode).
-   *
-   * <p>This differs from {@link ProcessHandle#pid()} when the server runs in a PID namespace under
-   * CRIU checkpoint/restore: the client connects to the host pid, which is what it reports here,
-   * whereas the server itself only observes its namespace-local pid.
-   */
-  public int getClientSeenServerPid() {
-    return clientSeenServerPid;
   }
 
   /**

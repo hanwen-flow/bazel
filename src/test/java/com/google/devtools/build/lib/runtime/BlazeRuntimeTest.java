@@ -422,7 +422,6 @@ public class BlazeRuntimeTest {
         /* idleTaskResultsFromPreviousIdlePeriod= */ ImmutableList.of(),
         /* shutdownReasonConsumer= */ shutdownReason::set,
         /* commandExtensions= */ ImmutableList.of(),
-        /* clientSeenServerPid= */ 0,
         NO_OP_COMMAND_EXTENSION_REPORTER,
         /* attemptNumber= */ 1,
         /* buildRequestIdOverride= */ null,

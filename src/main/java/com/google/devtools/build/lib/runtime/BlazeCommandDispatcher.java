@@ -170,7 +170,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
       Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
       Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
       List<Any> commandExtensions,
-      int clientSeenServerPid,
       CommandExtensionReporter commandExtensionReporter)
       throws InterruptedException {
     Preconditions.checkNotNull(clientDescription);
@@ -276,7 +275,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
                   startupOptionsTaggedWithBazelRc,
                   idleTaskResultsFromPreviousIdlePeriod,
                   commandExtensions,
-                  clientSeenServerPid,
                   attemptNumber,
                   attemptedCommandIds,
                   buildRequestIdOverride,
@@ -327,7 +325,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
         /* startupOptionsTaggedWithBazelRc= */ Optional.empty(),
         /* idleTaskResultsSupplier= */ () -> ImmutableList.of(),
         /* commandExtensions= */ ImmutableList.of(),
-        /* clientSeenServerPid= */ 0,
         /* commandExtensionReporter= */ (ext) -> {});
   }
 
@@ -343,7 +340,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
       Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
       @Nullable ImmutableList<IdleTask.Result> idleTaskResultsFromPreviousIdlePeriod,
       List<Any> commandExtensions,
-      int clientSeenServerPid,
       int attemptNumber,
       Set<UUID> attemptedCommandIds,
       @Nullable String buildRequestIdOverride,
@@ -382,7 +378,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
             idleTaskResultsFromPreviousIdlePeriod,
             this::setShutdownReason,
             commandExtensions,
-            clientSeenServerPid,
             commandExtensionReporter,
             attemptNumber,
             buildRequestIdOverride,

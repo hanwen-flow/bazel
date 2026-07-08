@@ -202,7 +202,6 @@ public final class RemoteModuleTest {
         /* idleTaskResultsFromPreviousIdlePeriod= */ ImmutableList.of(),
         /* shutdownReasonConsumer= */ s -> {},
         /* commandExtensions= */ ImmutableList.of(),
-        /* clientSeenServerPid= */ 0,
         NO_OP_COMMAND_EXTENSION_REPORTER,
         /* attemptNumber= */ 1,
         /* buildRequestIdOverride= */ null,

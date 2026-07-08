@@ -516,6 +516,14 @@ static vector<string> GetServerExeArgs(const blaze_util::Path &jvm_path,
                      blaze_util::ToString(startup_options.command_port));
   }
 
+  // In CRIU mode the server runs in a PID namespace and only sees its small
+  // namespace-local pid. Tell it so it stamps its *host* pid (published by the
+  // launcher to server/server.host_pid) into server_info.rawproto, rather than
+  // its ProcessHandle pid. See blaze_criu.cc and CommandServer.
+  if (CriuModeActive()) {
+    result.push_back("--criu");
+  }
+
   result.push_back("--connect_timeout_secs=" +
                    blaze_util::ToString(startup_options.connect_timeout_secs));
 
@@ -2188,10 +2196,6 @@ unsigned int BlazeServer::Communicate(
   request.set_quiet(quiet_);
   request.set_preemptible(preemptible_);
   request.set_client_description("pid=" + blaze::GetProcessIdAsString());
-  // Tell the server the pid the client used to reach it. This is the host pid
-  // even when the server runs in a CRIU PID namespace (where the server would
-  // otherwise only see its small namespace-local pid); see ServerInfo.pid.
-  request.set_client_seen_server_pid(process_info_.server_pid_);
   for (const string &arg : arg_vector) {
     request.add_arg(arg);
   }

@@ -116,6 +116,7 @@ java_library(
         "//src/main/java/com/google/devtools/build/lib/runtime:blaze_command_result",
         "//src/main/java/com/google/devtools/build/lib/runtime:command_dispatcher",
         "//src/main/java/com/google/devtools/build/lib/runtime:safe_request_logging",
+        "//src/main/java/com/google/devtools/build/lib/server/signal",
         "//src/main/java/com/google/devtools/build/lib/util",
         "//src/main/java/com/google/devtools/build/lib/util:abrupt_exit_exception",
         "//src/main/java/com/google/devtools/build/lib/util:detailed_exit_code",

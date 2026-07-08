@@ -42,6 +42,7 @@ import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.Filesystem;
 import com.google.devtools.build.lib.server.FailureDetails.Filesystem.Code;
 import com.google.devtools.build.lib.server.FailureDetails.GrpcServer;
+import com.google.devtools.build.lib.server.signal.ControlSignalHandler;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.DetailedExitCode;
 import com.google.devtools.build.lib.util.ExitCode;
@@ -67,6 +68,7 @@ import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.time.Duration;
 import java.util.Optional;
 import javax.annotation.Nullable;
 
@@ -93,6 +95,7 @@ public class CommandServer implements GrpcCommandServer.Callback {
       int port,
       Path serverDirectory,
       int serverPid,
+      boolean criuMode,
       int maxIdleSeconds,
       boolean shutdownOnLowSysMem,
       boolean idleServerTasks,
@@ -109,6 +112,7 @@ public class CommandServer implements GrpcCommandServer.Callback {
         generateCookie(random, 16),
         serverDirectory,
         serverPid,
+        criuMode,
         maxIdleSeconds,
         shutdownOnLowSysMem,
         idleServerTasks,
@@ -226,6 +230,15 @@ public class CommandServer implements GrpcCommandServer.Callback {
   private static final String REQUEST_COOKIE_FILE = "request_cookie";
   private static final String RESPONSE_COOKIE_FILE = "response_cookie";
   private static final String SERVER_INFO_FILE = "server_info.rawproto";
+  // Written by the launcher in CRIU mode with the server's host pid (see blaze_criu.cc). The
+  // server, which otherwise only sees its namespace-local pid, reads it to advertise the host pid.
+  private static final String HOST_PID_FILE = "server.host_pid";
+
+  // How long the fresh-start rawproto write waits for the launcher to publish server.host_pid
+  // before falling back to the namespace-local pid (which the reconciler then corrects). The
+  // launcher resolves the host pid right after daemonize forks the JVM, well before the JVM reaches
+  // here, so this bound is rarely approached.
+  private static final Duration HOST_PID_WAIT_TIMEOUT = Duration.ofSeconds(10);
 
   private final GrpcCommandServer grpcCommandServer;
   private final CommandManager commandManager;
@@ -239,7 +252,16 @@ public class CommandServer implements GrpcCommandServer.Callback {
   private final boolean shutdownOnLowSysMem;
   private final PidFileWatcher pidFileWatcher;
   private final int serverPid;
+  // Whether the server runs under CRIU checkpoint/restore (in a PID namespace). When true, the pid
+  // advertised in server_info.rawproto is the host pid read from HOST_PID_FILE, not serverPid, and
+  // a HostPidFileWatcher keeps that pid current across restores.
+  private final boolean criuMode;
   private final int port;
+
+  // The host pid most recently stamped into server_info.rawproto. Guarded by this; only meaningful
+  // in CRIU mode. -1 until the first write. The reconciler rewrites rawproto when HOST_PID_FILE
+  // diverges from this.
+  private int publishedHostPid = -1;
 
   @VisibleForTesting
   CommandServer(
@@ -253,6 +275,7 @@ public class CommandServer implements GrpcCommandServer.Callback {
       String responseCookie,
       Path serverDirectory,
       int serverPid,
+      boolean criuMode,
       int maxIdleSeconds,
       boolean shutdownOnLowSysMem,
       boolean doIdleServerTasks,
@@ -267,6 +290,7 @@ public class CommandServer implements GrpcCommandServer.Callback {
     this.responseCookie = responseCookie;
     this.serverDirectory = serverDirectory;
     this.serverPid = serverPid;
+    this.criuMode = criuMode;
     this.maxIdleSeconds = maxIdleSeconds;
     this.shutdownOnLowSysMem = shutdownOnLowSysMem;
 
@@ -376,9 +400,29 @@ public class CommandServer implements GrpcCommandServer.Callback {
     writeServerFile(REQUEST_COOKIE_FILE, requestCookie);
     writeServerFile(RESPONSE_COOKIE_FILE, responseCookie);
 
+    // In CRIU mode the pid the client connects to is the host pid, which the server cannot observe
+    // itself (it runs in a PID namespace). The launcher publishes it to HOST_PID_FILE; wait for it
+    // so rawproto is correct on its first and only write. On timeout, fall back to our own pid --
+    // the HostPidFileWatcher will correct rawproto once the file appears.
+    int hostPid = criuMode ? awaitHostPid() : serverPid;
+    writeServerInfoFile(addressString, hostPid);
+
+    if (criuMode) {
+      // A restored server resumes a frozen JVM that never re-runs this method, so watch
+      // HOST_PID_FILE and rewrite rawproto whenever the launcher publishes a new host pid.
+      new HostPidFileWatcher(addressString).start();
+    }
+  }
+
+  /**
+   * Writes {@code server_info.rawproto} advertising {@code pid}, atomically (write to a temp file
+   * then rename) so a reader never sees incomplete contents. Records {@code pid} as the currently
+   * published host pid.
+   */
+  private void writeServerInfoFile(String addressString, int pid) throws AbruptExitException {
     ServerInfo info =
         ServerInfo.newBuilder()
-            .setPid(serverPid)
+            .setPid(pid)
             .setAddress(addressString)
             .setRequestCookie(requestCookie)
             .setResponseCookie(responseCookie)
@@ -395,6 +439,97 @@ public class CommandServer implements GrpcCommandServer.Callback {
       shutdownHooks.deleteAtExit(serverInfoFile);
     } catch (IOException e) {
       throw createFilesystemFailureException("Failed to write server info file", e);
+    }
+    synchronized (this) {
+      publishedHostPid = pid;
+    }
+  }
+
+  /**
+   * Blocks until the launcher publishes the host pid to {@code server.host_pid}, then returns it.
+   * Falls back to {@link #serverPid} (the namespace-local pid) if the file does not appear within
+   * {@link #HOST_PID_WAIT_TIMEOUT}; the {@link HostPidFileWatcher} corrects rawproto later.
+   */
+  private int awaitHostPid() {
+    long deadlineMillis = clock.currentTimeMillis() + HOST_PID_WAIT_TIMEOUT.toMillis();
+    while (true) {
+      int hostPid = readHostPidFile();
+      if (hostPid > 0) {
+        return hostPid;
+      }
+      if (clock.currentTimeMillis() >= deadlineMillis) {
+        logger.atWarning().log(
+            "CRIU: timed out waiting for %s; advertising namespace-local pid %d until it appears",
+            HOST_PID_FILE, serverPid);
+        return serverPid;
+      }
+      try {
+        Thread.sleep(50);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return serverPid;
+      }
+    }
+  }
+
+  /** Reads the host pid from {@code server.host_pid}, or -1 if it is absent or unparseable. */
+  private int readHostPidFile() {
+    Path hostPidFile = serverDirectory.getChild(HOST_PID_FILE);
+    try {
+      if (!hostPidFile.exists()) {
+        return -1;
+      }
+      return Integer.parseInt(new String(FileSystemUtils.readContentAsLatin1(hostPidFile)).trim());
+    } catch (IOException | NumberFormatException e) {
+      return -1;
+    }
+  }
+
+  /**
+   * After a CRIU restore the server's host pid changes (a new process), but the resumed JVM does
+   * not re-run {@link #writeServerStatusFiles}. This watcher re-reads {@code server.host_pid} and,
+   * if the launcher has published a pid different from the one currently in rawproto, rewrites
+   * rawproto from in-memory state (port and cookies survive restore; only the pid changes).
+   *
+   * <p>Reconciliation is triggered by a signal from the launcher ({@link #RECONCILE_SIGNAL}) rather
+   * than by polling: the launcher publishes the new host pid, signals the server, and waits for
+   * rawproto to catch up before letting a client connect. The signal handler is installed before
+   * the checkpoint, so it is present in the restored image. {@code SIGWINCH} is used because its
+   * default disposition is to be ignored, so a delivery before the handler is installed (or to a
+   * non-CRIU build) cannot terminate the server.
+   */
+  private static final String RECONCILE_SIGNAL = "WINCH";
+
+  private final class HostPidFileWatcher {
+    private final String addressString;
+
+    HostPidFileWatcher(String addressString) {
+      this.addressString = addressString;
+    }
+
+    void start() {
+      // The handler must exist in the checkpointed image so it survives into the restored process;
+      // installing it here (before serveAndAwaitTermination blocks) guarantees that.
+      var unused = new ControlSignalHandler(RECONCILE_SIGNAL, this::reconcile);
+    }
+
+    private void reconcile() {
+      int hostPid = readHostPidFile();
+      if (hostPid <= 0) {
+        return;
+      }
+      synchronized (CommandServer.this) {
+        if (hostPid == publishedHostPid) {
+          return;
+        }
+      }
+      try {
+        writeServerInfoFile(addressString, hostPid);
+        logger.atInfo().log("CRIU: reconciled server_info.rawproto to host pid %d", hostPid);
+      } catch (AbruptExitException e) {
+        logger.atWarning().withCause(e).log(
+            "CRIU: failed to reconcile server_info.rawproto to host pid %d", hostPid);
+      }
     }
   }
 
@@ -514,7 +649,6 @@ public class CommandServer implements GrpcCommandServer.Callback {
                 Optional.of(startupOptions.build()),
                 commandManager::getIdleTaskResults,
                 request.getCommandExtensionsList(),
-                request.getClientSeenServerPid(),
                 new RpcCommandExtensionReporter(command.getId(), responseCookie, responder));
       } catch (OptionsParsingException e) {
         rpcOutErr.printErrLn(e.getMessage());

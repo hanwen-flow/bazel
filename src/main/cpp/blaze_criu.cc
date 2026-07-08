@@ -34,6 +34,14 @@ using std::vector;
 namespace {
 // Subdirectory of output_base holding CRIU checkpoint images.
 constexpr char kCriuImagesSubdir[] = "criu";
+// File (inside the server dir) into which the launcher publishes the server's
+// *host* pid once it has resolved it from /proc. The CRIU-mode server reads it
+// to stamp its host pid into server_info.rawproto (it only sees its small
+// namespace-local pid itself), and a reconciler thread in the server re-reads
+// it after a restore to keep the pid current. Written as a bare decimal with no
+// trailing newline (the server parses it with a strict Integer.parseInt). Must
+// match the name used by CommandServer/HostPidFileWatcher on the Java side.
+constexpr char kHostPidFile[] = "server.host_pid";
 // File (inside the images dir) recording the checkpointed namespace-local pid,
 // written at checkpoint time. Restore uses it to find the restored server
 // without trusting bazel's mutable server.pid.txt. Matches horapha's
@@ -930,31 +938,6 @@ bool RunInNamespace(const vector<string> &fg_argv, const vector<string> &fg_env,
 // Ported from horapha's internal/serverinfo.
 // ---------------------------------------------------------------------------
 
-// Reads field 22 (start time, jiffies since boot) of /proc/<pid>/stat as a
-// decimal string. The comm field (2nd) is parenthesized and may contain
-// spaces, so we split after the last ')'.
-bool ReadStartTime(int pid, string *start_time) {
-  string statline;
-  if (!blaze_util::ReadFile("/proc/" + std::to_string(pid) + "/stat",
-                            &statline)) {
-    return false;
-  }
-  string::size_type rparen = statline.rfind(')');
-  if (rparen == string::npos) {
-    return false;
-  }
-  // blaze_util::Split skips empty subsections, so the leading space after ')'
-  // does not produce a spurious token. After ')' the first field is #3
-  // (state); start time is field #22, i.e. index 19 counting from #3.
-  vector<string> fields = blaze_util::Split(statline.substr(rparen + 1), ' ');
-  const size_t kStartTimeIndexAfterComm = 19;
-  if (fields.size() <= kStartTimeIndexAfterComm) {
-    return false;
-  }
-  *start_time = fields[kStartTimeIndexAfterComm];
-  return true;
-}
-
 // Returns the innermost-namespace pid for a host pid, and whether the process
 // is actually in a nested PID namespace (the NSpid line has >1 field).
 bool InnerNsPid(int host_pid, int *inner) {
@@ -1062,97 +1045,96 @@ bool WaitHostPidForNsPid(int ns_pid, const string &want_comm,
   }
 }
 
-// Rewrites field 1 (pid, a varint) of the ServerInfo proto at `path` to new_pid,
-// leaving every other field byte-for-byte intact. ServerInfo declares pid as
-// field 1 and protobuf serializes fields in order, so it is first (leading byte
-// 0x08 == (field 1 << 3) | wiretype 0). Ported from horapha's
-// PatchRawprotoPID.
-bool PatchRawprotoPid(const blaze_util::Path &path, int new_pid) {
-  // daemonize returns as soon as the pid file exists, but the server writes
-  // server_info.rawproto a little later during startup. Wait for it to appear
-  // (and be non-empty) before patching.
-  string data;
-  auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(10);
-  while (true) {
-    if (blaze_util::ReadFile(path, &data) && !data.empty()) {
-      break;
-    }
-    if (std::chrono::steady_clock::now() > deadline) {
-      BAZEL_LOG(USER) << "criu: timed out waiting for server_info.rawproto: "
-                      << path.AsPrintablePath();
-      return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  if (static_cast<unsigned char>(data[0]) != 0x08) {
-    BAZEL_LOG(USER) << "criu: rawproto bad lead byte (size=" << data.size()
-                    << ")";
-    return false;
-  }
-  // Skip the existing varint value.
-  size_t i = 1;
-  while (i < data.size()) {
-    unsigned char b = static_cast<unsigned char>(data[i]);
-    i++;
-    if ((b & 0x80) == 0) {
-      break;
-    }
-  }
-  string rest = data.substr(i);
-
-  string out;
-  out.push_back(0x08);
-  uint64_t v = static_cast<uint64_t>(new_pid);
-  while (v >= 0x80) {
-    out.push_back(static_cast<char>((v & 0x7f) | 0x80));
-    v >>= 7;
-  }
-  out.push_back(static_cast<char>(v));
-  out += rest;
-
-  // Write atomically so a reader never sees a half-written proto.
-  blaze_util::Path tmp(path.AsNativePath() + ".bazel-criu.tmp");
-  if (!blaze_util::WriteFile(out, tmp)) {
-    BAZEL_LOG(USER) << "criu: rawproto tmp write failed: "
-                    << tmp.AsPrintablePath();
+// Publishes `host_pid` to server/server.host_pid so the CRIU-mode server can
+// stamp it into server_info.rawproto itself. Unlike the old byte-patching of
+// rawproto, the launcher never touches rawproto: the server is its sole writer,
+// so the canonical identity file is correct on its first and only write and an
+// interrupted startup cannot leave a rawproto advertising the (wrong)
+// namespace-local pid.
+//
+// Written atomically (tmp + rename) as a bare decimal with NO trailing newline:
+// the Java side parses it with a strict Integer.parseInt (see
+// HostPidFileWatcher), which rejects a trailing '\n'. Also mirrors how the
+// launcher writes server.pid.txt.
+bool WriteHostPidFile(const blaze_util::Path &server_dir, int host_pid) {
+  const blaze_util::Path path = server_dir.GetRelative(kHostPidFile);
+  const blaze_util::Path tmp(path.AsNativePath() + ".tmp");
+  if (!blaze_util::WriteFile(std::to_string(host_pid), tmp)) {
+    BAZEL_LOG(USER) << "criu: could not write " << tmp.AsPrintablePath();
     return false;
   }
   if (rename(tmp.AsNativePath().c_str(), path.AsNativePath().c_str()) != 0) {
-    BAZEL_LOG(USER) << "criu: rawproto rename failed: "
+    BAZEL_LOG(USER) << "criu: could not rename " << tmp.AsPrintablePath()
+                    << " -> " << path.AsPrintablePath() << ": "
                     << blaze_util::GetLastErrorString();
     return false;
   }
   return true;
 }
 
-// Makes the server identified by host_pid reachable by a host-side client, by
-// writing host_pid into rawproto's pid field and host_pid's current start time
-// into server.starttime. Use after a restore (new pid, new start time) or after
-// a fresh namespaced start (the server advertised its namespace-local pid).
-bool RewriteServerIdentity(const blaze_util::Path &server_dir, int host_pid) {
-  string start_time;
-  if (!ReadStartTime(host_pid, &start_time)) {
-    BAZEL_LOG(USER) << "criu: could not read start time of host pid "
-                    << host_pid;
+// Reads field 1 (pid, a varint) of the ServerInfo proto at `path` into *pid.
+// ServerInfo declares pid as field 1 and protobuf serializes fields in order,
+// so it is first (leading byte 0x08 == (field 1 << 3) | wiretype 0). Returns
+// false if the file is missing, empty, or does not start with a pid field.
+bool ReadRawprotoPid(const blaze_util::Path &path, int *pid) {
+  string data;
+  if (!blaze_util::ReadFile(path, &data) || data.empty()) {
     return false;
   }
-  if (!PatchRawprotoPid(server_dir.GetRelative("server_info.rawproto"),
-                        host_pid)) {
-    BAZEL_LOG(USER) << "criu: could not patch server_info.rawproto pid";
+  if (static_cast<unsigned char>(data[0]) != 0x08) {
     return false;
   }
-  if (!blaze_util::WriteFile(start_time,
-                             server_dir.GetRelative("server.starttime"))) {
-    BAZEL_LOG(USER) << "criu: could not write server.starttime";
-    return false;
+  uint64_t v = 0;
+  int shift = 0;
+  for (size_t i = 1; i < data.size(); i++) {
+    unsigned char b = static_cast<unsigned char>(data[i]);
+    v |= static_cast<uint64_t>(b & 0x7f) << shift;
+    if ((b & 0x80) == 0) {
+      *pid = static_cast<int>(v);
+      return true;
+    }
+    shift += 7;
   }
-  return true;
+  return false;  // truncated varint
+}
+
+// Waits until server_info.rawproto advertises `host_pid`, re-poking the server
+// with SIGWINCH each iteration so it re-reads server.host_pid and rewrites
+// rawproto. On a fresh start the server writes rawproto correct on its first
+// write (from server.host_pid directly), so this returns almost at once and the
+// signal is a harmless no-op. After a restore the resumed JVM updates rawproto
+// only in response to the signal; re-sending each iteration is robust against a
+// poke that raced the restored process becoming ready. SIGWINCH is ignored by
+// default, and the server's handler is idempotent once rawproto already matches.
+// Returns false on timeout.
+bool WaitRawprotoPid(const blaze_util::Path &server_dir, int host_pid,
+                     int timeout_secs) {
+  const blaze_util::Path path = server_dir.GetRelative(kServerInfoName);
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
+  while (true) {
+    int pid;
+    if (ReadRawprotoPid(path, &pid) && pid == host_pid) {
+      return true;
+    }
+    if (std::chrono::steady_clock::now() > deadline) {
+      return false;
+    }
+    if (kill(host_pid, SIGWINCH) != 0) {
+      BAZEL_LOG(INFO) << "criu: could not signal host pid " << host_pid << ": "
+                      << blaze_util::GetLastErrorString();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
 }
 
 // Resolves the server's namespace-local pid to its host pid (within the PID
-// namespace identified by ns_namespace) and rewrites the on-disk identity
-// files. Returns the host pid, or -1 on failure.
+// namespace identified by ns_namespace), publishes it to server.host_pid,
+// pokes the server to reconcile, and waits until server_info.rawproto
+// advertises it (the server stamps it there itself). Returns the host pid, or
+// -1 on failure. On a fresh start the server blocks on server.host_pid before
+// writing rawproto; after a restore the server's signal handler rewrites
+// rawproto when poked.
 int MakeReachable(int ns_pid, const string &ns_namespace,
                   const blaze_util::Path &server_dir, int timeout_secs) {
   int host_pid;
@@ -1162,9 +1144,19 @@ int MakeReachable(int ns_pid, const string &ns_namespace,
                     << ns_pid;
     return -1;
   }
-  if (!RewriteServerIdentity(server_dir, host_pid)) {
-    BAZEL_LOG(USER) << "criu: could not rewrite server identity for host pid "
-                    << host_pid;
+  if (!WriteHostPidFile(server_dir, host_pid)) {
+    BAZEL_LOG(USER) << "criu: could not publish host pid " << host_pid
+                    << " to " << server_dir.GetRelative(kHostPidFile)
+                                     .AsPrintablePath();
+    return -1;
+  }
+  // Poke the server (see WaitRawprotoPid) to re-read server.host_pid and rewrite
+  // server_info.rawproto, and wait until it advertises the host pid.
+  if (!WaitRawprotoPid(server_dir, host_pid, timeout_secs)) {
+    BAZEL_LOG(USER) << "criu: server did not advertise host pid " << host_pid
+                    << " in " << server_dir.GetRelative(kServerInfoName)
+                                     .AsPrintablePath()
+                    << " within " << timeout_secs << "s";
     return -1;
   }
   return host_pid;
@@ -1556,10 +1548,11 @@ bool CriuRestore(const blaze_util::Path &output_base) {
   }
 
   // Recover server_info.rawproto from the checkpoint-time snapshot if the live
-  // file is gone (a graceful `bazel shutdown` between checkpoints deletes it,
-  // and the restored process never rewrites it). MakeReachable patches the pid
-  // field in place, so the file must exist first; the embedded port/cookies are
-  // still valid for the revived process.
+  // file is gone (a graceful `bazel shutdown` between checkpoints deletes it).
+  // The restored server's reconciler thread rewrites rawproto from its
+  // in-memory state once MakeReachable publishes the new host pid, so this is
+  // only a fallback to ensure a file is present in the meantime; the embedded
+  // port/cookies are still valid for the revived process.
   const blaze_util::Path live_info = server_dir.GetRelative(kServerInfoName);
   const blaze_util::Path snapshot_info =
       images_dir.GetRelative(kServerInfoName);
