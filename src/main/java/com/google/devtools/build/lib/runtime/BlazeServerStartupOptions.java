@@ -118,6 +118,19 @@ public abstract class BlazeServerStartupOptions extends OptionsBase {
               + " another server from attempting to garbage collect it.")
   public abstract boolean getLockInstallBase();
 
+  @Option(
+      name = "criu",
+      defaultValue = "false", // NOTE: only for documentation, value is always passed by the client.
+      documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
+      effectTags = {OptionEffectTag.BAZEL_INTERNAL_CONFIGURATION},
+      metadataTags = {OptionMetadataTag.HIDDEN},
+      help =
+          "Set by the launcher when running under CRIU checkpoint/restore. The server then runs in"
+              + " a PID namespace and only sees its namespace-local pid, so it publishes its host"
+              + " pid (read from server/server.host_pid, written by the launcher) in"
+              + " server_info.rawproto and for 'info server_pid'.")
+  public abstract boolean getCriu();
+
   /* Note: The help string in this option applies to the client code; not
    * the server code. The server code will only accept a non-empty path; it's
    * the responsibility of the client to compute a proper default if

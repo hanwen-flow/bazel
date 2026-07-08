@@ -492,7 +492,6 @@ public final class BlazeCommandDispatcherTest {
                     /* startupOptionsTaggedWithBazelRc= */ Optional.empty(),
                     /* idleTaskResultsSupplier= */ () -> ImmutableList.of(),
                     /* commandExtensions= */ ImmutableList.of(),
-                    /* clientSeenServerPid= */ 0,
                     /* commandExtensionReporter= */ (ext) -> {}));
 
     try {

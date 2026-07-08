@@ -112,6 +112,7 @@ public final class CommandServerTest {
             RESPONSE_COOKIE,
             serverDirectory,
             SERVER_PID,
+            /* criuMode= */ false,
             /* maxIdleSeconds= */ 1000,
             /* shutdownOnLowSysMem= */ false,
             /* doIdleServerTasks= */ true,
@@ -161,7 +162,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter) {
             argsReceived.set(args);
             commandExtensionsReceived.set(commandExtensions);
@@ -285,7 +285,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter) {
             synchronized (this) {
               assertThrows(InterruptedException.class, this::wait);
@@ -338,7 +337,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter) {
             OutputStream out = outErr.getOutputStream();
             try {
@@ -490,7 +488,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter) {
             OutputStream out = outErr.getOutputStream();
             try {
@@ -556,7 +553,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter)
               throws InterruptedException {
             synchronized (this) {
@@ -777,7 +773,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter) {
             if (args.contains(firstCommandArg)) {
               while (true) {
@@ -877,7 +872,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter)
               throws InterruptedException {
             if (args.contains(firstCommandArg)) {
@@ -983,7 +977,6 @@ public final class CommandServerTest {
               Optional<List<Pair<String, String>>> startupOptionsTaggedWithBazelRc,
               Supplier<ImmutableList<IdleTask.Result>> idleTaskResultsSupplier,
               List<Any> commandExtensions,
-              int clientSeenServerPid,
               CommandExtensionReporter commandExtensionReporter)
               throws InterruptedException {
             if (args.contains(firstCommandArg)) {
@@ -1078,7 +1071,6 @@ public final class CommandServerTest {
             startupOptionsTaggedWithBazelRc,
             idleTaskResultsSupplier,
             commandExtensions,
-            clientSeenServerPid,
             commandExtensionReporter) -> {
           if (args.contains("1")) {
             return BlazeCommandResult.withIdleTasks(
@@ -1146,7 +1138,6 @@ public final class CommandServerTest {
         startupOptionsTaggedWithBazelRc,
         idleTaskResultsSupplier,
         commandExtensions,
-        clientSeenServerPid,
         commandExtensionReporter) -> {
       throw new IllegalStateException("Command exec not expected");
     };

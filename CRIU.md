@@ -100,11 +100,17 @@ cd ~/my/workspace        # any dir under a MODULE.bazel / WORKSPACE
 
 The reported `server_pid` is the server's **host** pid, not its namespace-local
 one. The server itself only sees its small namespace-local pid (e.g. `7`) via
-`ProcessHandle`; the client, however, connects over the host pid (the launcher
-stamps it into `server_info.rawproto`) and passes it into each request, and the
-`server_pid` info item echoes that back. So `info server_pid` matches the pid
+`ProcessHandle`. The launcher resolves the host pid from `/proc` and publishes
+it to `$OB/server/server.host_pid`; the CRIU-mode server reads that file and
+stamps the host pid into `server_info.rawproto` itself (so the file is correct
+on its first write, never advertising the namespace-local pid), and the
+`server_pid` info item reads the same file. So `info server_pid` matches the pid
 you see for the `java` process on the host — even across a restore, when the
-host pid changes but the namespace-local pid does not.
+host pid changes but the namespace-local pid does not. On restore, the launcher
+publishes the new host pid and pokes the resumed JVM with `SIGWINCH`; the
+server's signal handler re-reads `server.host_pid` and rewrites
+`server_info.rawproto` with the new host pid, and the launcher waits for that
+before attaching.
 
 To confirm the server really lives in a PID namespace, inspect `/proc`
 directly. Both the persisted init and the server carry `--output_base=$OB` on
@@ -246,11 +252,13 @@ done
   against the launcher's `PATH`. If it lives somewhere non-standard (e.g.
   `/usr/local/sbin`), either add that to `PATH` or set `BAZEL_CRIU_BINARY` to its
   absolute path.
-* **Client starts a fresh server instead of attaching after restore.** The
-  on-disk identity rewrite did not land. Check that `$OB/server/server.starttime`
-  and `server_info.rawproto` exist, and that the restored `java` process is
-  findable under the recorded `ns-pid` (the launcher waits up to 30s for the
-  reparent to settle).
+* **Client starts a fresh server instead of attaching after restore.** The host
+  pid did not propagate into `server_info.rawproto`. Check that
+  `$OB/server/server.host_pid` holds the restored `java` process's host pid and
+  that `server_info.rawproto`'s pid field matches it (the launcher pokes the
+  server with `SIGWINCH` to rewrite rawproto from `server.host_pid` and waits up
+  to 30s for it to converge before attaching), and that the restored `java`
+  process is findable under the recorded `ns-pid`.
 * **`UnsupportedClassVersionError` in the server log.** The
   `--server_javabase` does not match the JDK `bazel-dev` was built with; point it
   at the right JDK (step 1).
