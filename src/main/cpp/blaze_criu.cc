@@ -163,6 +163,7 @@ int CriuCheckpoint(const blaze_util::Path &, const std::string &, bool) {
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <thread>
 
 #ifndef environ
@@ -1162,6 +1163,26 @@ int MakeReachable(int ns_pid, const string &ns_namespace,
   return host_pid;
 }
 
+// Returns a human-readable local timestamp ("YYYY-MM-DD HH:MM:SS") of when
+// `path` was last modified, or "" if it cannot be stat'd/formatted. The
+// checkpoint's ns-pid file is (re)written the instant `criu dump` succeeds (see
+// RunCriuDump), so its mtime is the checkpoint's creation time.
+string FileModTime(const blaze_util::Path &path) {
+  struct stat st;
+  if (stat(path.AsNativePath().c_str(), &st) != 0) {
+    return "";
+  }
+  struct tm tm_buf;
+  if (localtime_r(&st.st_mtime, &tm_buf) == nullptr) {
+    return "";
+  }
+  char buf[32];
+  if (strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf) == 0) {
+    return "";
+  }
+  return string(buf);
+}
+
 // Reads a pid from a "<n>\n" file.
 bool ReadPidFile(const blaze_util::Path &path, int *pid) {
   string bufstr;
@@ -1467,8 +1488,15 @@ bool CriuRestore(const blaze_util::Path &output_base) {
     return false;
   }
 
+  // The ns-pid file's mtime is stamped when the checkpoint's `criu dump`
+  // completed, so it dates the snapshot we are about to revive.
+  const string created =
+      FileModTime(images_dir.GetRelative(kNsPidFile));
   BAZEL_LOG(USER) << "Restoring server (ns pid " << ns_pid << ") from "
-                  << images_dir.AsPrintablePath() << " ...";
+                  << images_dir.AsPrintablePath()
+                  << (created.empty() ? "" : " (checkpoint created " + created +
+                                                 ")")
+                  << " ...";
 
   // Recreate server.pid.txt holding the server's namespace-local pid BEFORE the
   // restore runs, so the file is in place the instant the JVM resumes. The
