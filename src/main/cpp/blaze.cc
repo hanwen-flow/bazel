@@ -1261,7 +1261,20 @@ static ATTRIBUTE_NORETURN void RunClientServerMode(
           CriuCheckpointExists(startup_options.output_base, install_md5)) {
         BAZEL_LOG(USER) << "No server running; restoring CRIU checkpoint.";
         if (CriuRestore(startup_options.output_base)) {
-          if (!server->Connect()) {
+          if (server->Connect()) {
+            // Refresh server/cmdline to match the binary that owns this
+            // checkpoint. The checkpoint was keyed to our install_md5 (see
+            // CriuCheckpointExists above), so the revived server genuinely
+            // matches our server_exe_args -- but CriuRestore only recreates
+            // server.pid.txt and server_info.rawproto, not server/cmdline.
+            // Without this, cmdline still holds whatever the last *cold-started*
+            // server wrote (possibly a different binary's args), so the
+            // KillRunningServerIfDifferentStartupOptions check below would see a
+            // spurious mismatch, kill the just-restored server, and restore
+            // again on every invocation.
+            blaze_util::WriteFile(GetArgumentString(server_exe_args),
+                                  server_dir.GetRelative("cmdline"));
+          } else {
             // The restore reported success but we cannot talk to the revived
             // server. Cold-starting now discards the warm server, so surface
             // exactly why the connect failed before falling back.
