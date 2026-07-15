@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.analysis.BlazeDirectories;
 import com.google.devtools.build.lib.runtime.BlazeModule;
 import com.google.devtools.build.lib.runtime.BlazeRuntime;
+import com.google.devtools.build.lib.runtime.BlazeServerStartupOptions;
 import com.google.devtools.build.lib.runtime.WorkspaceBuilder;
 import com.google.devtools.build.lib.skyframe.DiffAwareness;
 import com.google.devtools.build.lib.skyframe.FsEventsNativeDepsService;
@@ -30,6 +31,12 @@ public class BazelDiffAwarenessModule extends BlazeModule {
   @Override
   public void workspaceInit(
       BlazeRuntime runtime, BlazeDirectories directories, WorkspaceBuilder builder) {
+    // File-system watching (inotify/FSEvents) state does not survive a CRIU checkpoint/restore, so
+    // in CRIU mode we don't register the file-watching diff awareness at all; --watchfs is ignored
+    // (CommandEnvironment.beforeCommand warns if it was set explicitly).
+    if (runtime.getStartupOptionsProvider().getOptions(BlazeServerStartupOptions.class).getCriu()) {
+      return;
+    }
     // Order here is important - LocalDiffAwareness creation always succeeds, so it must be last.
     builder.addDiffAwarenessFactory(
         new LocalDiffAwareness.Factory(

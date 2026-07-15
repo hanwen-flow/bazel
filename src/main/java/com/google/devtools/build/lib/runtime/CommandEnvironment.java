@@ -56,6 +56,7 @@ import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.server.FailureDetails.Skyfocus;
 import com.google.devtools.build.lib.server.IdleTask;
 import com.google.devtools.build.lib.skyframe.BuildResultListener;
+import com.google.devtools.build.lib.skyframe.LocalDiffAwareness;
 import com.google.devtools.build.lib.skyframe.SkyfocusOptions;
 import com.google.devtools.build.lib.skyframe.SkyframeBuildView;
 import com.google.devtools.build.lib.skyframe.SkyframeExecutor;
@@ -936,6 +937,21 @@ public class CommandEnvironment {
   @VisibleForTesting
   public void beforeCommand(InvocationPolicy invocationPolicy) throws AbruptExitException {
     CommonCommandOptions commonOptions = options.getOptions(CommonCommandOptions.class);
+
+    // File-system watching relies on inotify/FSEvents state that does not survive a CRIU
+    // checkpoint/restore, so --watchfs is ignored in CRIU mode (the file-watching diff awareness is
+    // not even registered; see BazelDiffAwarenessModule). Warn if the user asked for it explicitly.
+    if (options.containsExplicitOption("watchfs")
+        && runtime
+            .getStartupOptionsProvider()
+            .getOptions(BlazeServerStartupOptions.class)
+            .getCriu()) {
+      LocalDiffAwareness.Options diffOptions = options.getOptions(LocalDiffAwareness.Options.class);
+      if (diffOptions != null && diffOptions.getWatchFS()) {
+        reporter.handle(Event.warn("--watchfs is ignored in CRIU mode"));
+      }
+    }
+
     eventBus.post(new BuildMetadataEvent(makeMapFromMapEntries(commonOptions.getBuildMetadata())));
     eventBus.post(
         new GotOptionsEvent(runtime.getStartupOptionsProvider(), options, invocationPolicy));
