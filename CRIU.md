@@ -32,6 +32,19 @@ self-consistent mount view. That is what makes the dump succeed **rootless** (no
 `sudo`), with the images owned by your user (no `chown`), and without having to
 special-case the host's inherited snap/squashfs/FUSE mounts.
 
+Before it dumps, the `checkpoint` invocation first drives a server-side
+`checkpoint` command so the snapshot is not taken mid-build. That command runs
+on the server like any other, so the dispatcher's exclusive command lock
+guarantees no other command is in flight; while holding the lock it returns
+memory to the OS (a full GC plus interner shrinking), flushes buffered log
+streams, and then parks on a sentinel file (`$output_base/server/checkpoint.sentinel`)
+until it is removed. The launcher waits for the sentinel to appear (the server
+is now quiescent) before asking the init to `criu dump`, then removes the
+sentinel to release the parked command. On restore the launcher cannot reliably
+reach the sentinel across the namespace boundary in time, so the in-namespace
+init removes it just before it resumes the JVM; the resumed command finds it
+gone and returns before any real command runs.
+
 Before it starts, restores, or checkpoints a namespaced server, the launcher
 runs a **preflight check** of the roadblocks below and, if any fails, exits with
 an actionable message naming the knob and the command to fix it (rather than an

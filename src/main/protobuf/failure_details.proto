@@ -152,6 +152,7 @@ message FailureDetail {
     Skyfocus skyfocus = 185;
     RemoteAnalysisCaching remote_analysis_caching = 186;
     JniLinking jni_linking = 190;
+    CheckpointCommand checkpoint_command = 191;
   }
 
   reserved 102; // For internal use
@@ -1433,6 +1434,17 @@ message JniLinking {
   enum Code {
     JNI_LINKING_UNKNOWN = 0 [(metadata) = { exit_code: 37 }];
     JNI_LINKING_ERROR = 1 [(metadata) = { exit_code: 36 }];
+  }
+
+  Code code = 1;
+}
+
+message CheckpointCommand {
+  enum Code {
+    CHECKPOINT_COMMAND_UNKNOWN = 0 [(metadata) = { exit_code: 37 }];
+    NOT_CRIU_MODE = 1 [(metadata) = { exit_code: 2 }];
+    SENTINEL_IO_FAILURE = 2 [(metadata) = { exit_code: 36 }];
+    INTERRUPTED = 3 [(metadata) = { exit_code: 8 }];
   }
 
   Code code = 1;

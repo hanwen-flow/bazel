@@ -73,6 +73,12 @@ constexpr char kControlSockName[] = "bazel-criu.sock";
 // version check (EnsureCorrectRunningVersion) rewrites that symlink to the
 // current install_base before restore runs.
 constexpr char kInstallKeyFile[] = "install-key";
+// File (inside the server dir) the server-side `checkpoint` command creates once
+// it is quiescent (holding the command lock, having GC'd and flushed its logs)
+// and parks on. The launcher waits for it to appear, takes the criu dump, then
+// removes it to release the parked server. Its basename must match SENTINEL_FILE
+// in CheckpointCommand.java.
+constexpr char kCheckpointSentinelName[] = "checkpoint.sentinel";
 }  // namespace
 
 namespace {
@@ -90,6 +96,11 @@ bool CriuModeActive() {
 #else
   return false;
 #endif
+}
+
+blaze_util::Path CriuCheckpointSentinelPath(
+    const blaze_util::Path &output_base) {
+  return output_base.GetRelative("server").GetRelative(kCheckpointSentinelName);
 }
 
 bool CriuCheckpointExists(const blaze_util::Path &output_base,
@@ -188,6 +199,18 @@ void ChildPerror(const char *msg) {
   const char *es = strerror(e);
   char buf[256];
   int n = snprintf(buf, sizeof(buf), "criu: %s: %s\n", msg, es);
+  if (n > 0) {
+    (void)!write(STDERR_FILENO, buf, n < static_cast<int>(sizeof(buf))
+                                         ? n
+                                         : static_cast<int>(sizeof(buf)) - 1);
+  }
+}
+
+// Writes "criu: <msg>\n" to stderr. The errno-free counterpart of ChildPerror,
+// for fork-safe progress logging in the post-fork child paths.
+void ChildLog(const char *msg) {
+  char buf[256];
+  int n = snprintf(buf, sizeof(buf), "criu: %s\n", msg);
   if (n > 0) {
     (void)!write(STDERR_FILENO, buf, n < static_cast<int>(sizeof(buf))
                                          ? n
@@ -358,6 +381,10 @@ struct InitControl {
   // Where the snapshot is written (inside images_dir), so restore can recover
   // it after a graceful shutdown deletes the live file.
   const char *server_info_snapshot;
+  // $output_base/server/checkpoint.sentinel. On restore the init unlinks this
+  // from inside the namespace before resuming the server, releasing the parked
+  // `checkpoint` command (see RunInit and CheckpointCommand.java).
+  const char *sentinel_file;
 };
 
 // Reads a small unsigned decimal from `path` (e.g. server.pid.txt). Returns -1
@@ -673,6 +700,22 @@ bool HandleControlConn(const InitControl *ctl, int conn) {
   int lfd = (ctl != nullptr && ctl->sock_path[0] != '\0')
                 ? MakeControlSocket(ctl->sock_path)
                 : -1;
+
+  // Release any parked server-side `checkpoint` command before resuming the
+  // server. On restore the foreground command is `criu restore`, which revives
+  // the JVM as a child in this same mount namespace; the parked command polls
+  // the sentinel from a fresh stat() (see CheckpointCommand.java). Unlinking it
+  // here happens-before that fork, so the resumed JVM is guaranteed to observe
+  // the file gone on its next tick -- no race with a host-side unlink whose
+  // ordering against the resume we cannot control. On a fresh start the sentinel
+  // does not exist and this is a harmless no-op.
+  if (ctl != nullptr && ctl->sentinel_file[0] != '\0') {
+    if (unlink(ctl->sentinel_file) == 0) {
+      ChildLog("removed checkpoint sentinel; releasing parked server command");
+    } else if (errno != ENOENT) {
+      ChildPerror("unlink checkpoint sentinel");
+    }
+  }
 
   pid_t fg = fork();
   if (fg < 0) {
@@ -1223,6 +1266,7 @@ struct InitControlStorage {
   string server_pid_file;
   string server_info_file;
   string server_info_snapshot;
+  string sentinel_file;
   InitControl ctl;
 
   InitControlStorage(const blaze_util::Path &output_base, bool serve_control) {
@@ -1235,6 +1279,7 @@ struct InitControlStorage {
     server_pid_file = server.GetRelative(kServerPidFile).AsNativePath();
     server_info_file = server.GetRelative(kServerInfoName).AsNativePath();
     server_info_snapshot = images.GetRelative(kServerInfoName).AsNativePath();
+    sentinel_file = CriuCheckpointSentinelPath(output_base).AsNativePath();
     ctl.sock_path = sock.c_str();
     ctl.criu_bin = criu_bin.c_str();
     ctl.images_dir = images_dir.c_str();
@@ -1242,6 +1287,7 @@ struct InitControlStorage {
     ctl.server_pid_file = server_pid_file.c_str();
     ctl.server_info_file = server_info_file.c_str();
     ctl.server_info_snapshot = server_info_snapshot.c_str();
+    ctl.sentinel_file = sentinel_file.c_str();
   }
 };
 
@@ -1516,6 +1562,15 @@ bool CriuRestore(const blaze_util::Path &output_base) {
     BAZEL_LOG(USER) << "criu: could not write " << pid_file.AsPrintablePath();
     return false;
   }
+
+  // A checkpoint is taken while the server-side `checkpoint` command is parked
+  // holding the command lock, polling for the checkpoint sentinel to disappear
+  // (see RunCheckpoint and CheckpointCommand.java). The sentinel must be removed
+  // BEFORE criu resumes the process so the parked command sees it gone on its
+  // next tick and returns, releasing the command lock before any real command
+  // runs. RunInit does this from inside the namespace -- happening-before the
+  // fork that resumes the JVM -- rather than out here, so the removal is
+  // guaranteed visible to the resumed server (see RunInit).
 
   // criu restore runs as the foreground command of a fresh namespace; the init
   // adopts the --restore-detached tree and then persists, holding the namespace

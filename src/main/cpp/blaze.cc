@@ -242,6 +242,15 @@ class BlazeServer final {
   // is in connected state.
   void KillRunningServer();
 
+  // Sends the server-side `checkpoint` command on a background thread and
+  // returns immediately (the command parks on the server holding the exclusive
+  // command lock until the launcher removes the checkpoint sentinel, so it does
+  // not return until then). Only call this when the server is in connected
+  // state. The returned thread must be joined by the caller after the sentinel
+  // is removed; its gRPC stream is expected to be severed by the criu dump, so
+  // errors on it are ignored.
+  std::thread SendCheckpointCommand();
+
   // Cancel the currently running command. If there is no command currently
   // running, the result is unspecified. When called, this object must be in
   // connected state.
@@ -1679,6 +1688,69 @@ void PrintVersionInfo(const string& build_label, const string& product_name) {
   printf("%s %s\n", product_name.c_str(), build_label.c_str());
 }
 
+// Drives a server-assisted CRIU checkpoint of the running --criu server.
+//
+// A checkpoint taken while the server is mid-command would snapshot inconsistent
+// state, so we first drive the server-side `checkpoint` command: it takes the
+// exclusive command lock (excluding every other command), returns memory to the
+// OS, flushes its logs, then parks holding the lock until we remove a sentinel
+// file. Only once the server has signalled it is quiescent (the sentinel
+// appears) do we ask the in-namespace init to run `criu dump`. Afterwards we
+// remove the sentinel to release the parked command.
+//
+// Returns a process exit code (0 on success). `stop` tears the server down after
+// the dump; otherwise the warm server is left running and reattachable.
+static int RunCheckpoint(const StartupOptions &startup_options,
+                         const string &install_md5, bool stop,
+                         BlazeServer *server) {
+  server->AcquireLocks();
+  if (!server->Connect()) {
+    BAZEL_LOG(USER) << "criu: no --criu server is running for output base "
+                    << startup_options.output_base.AsPrintablePath()
+                    << " (" << server->ConnectError() << "); start one first.";
+    return blaze_exit_code::LOCAL_ENVIRONMENTAL_ERROR;
+  }
+
+  const blaze_util::Path sentinel =
+      CriuCheckpointSentinelPath(startup_options.output_base);
+  // A sentinel left over from an aborted checkpoint would make our wait below
+  // return immediately, before the server has actually quiesced. Clear it first.
+  blaze_util::UnlinkPath(sentinel);
+
+  // Ask the server to quiesce; it parks holding the command lock until we remove
+  // the sentinel. The RPC does not return until then, so it runs on its own
+  // thread. Its stream is severed by the criu dump's --tcp-close, which is
+  // harmless: the sentinel file, not the RPC, is our synchronization channel.
+  std::thread checkpoint_thread = server->SendCheckpointCommand();
+
+  // Wait for the server to signal it is quiescent by creating the sentinel.
+  constexpr int kQuiesceTimeoutSecs = 120;
+  const uint64_t deadline_ms =
+      GetMillisecondsMonotonic() + kQuiesceTimeoutSecs * 1000;
+  while (!blaze_util::PathExists(sentinel)) {
+    if (GetMillisecondsMonotonic() > deadline_ms) {
+      BAZEL_LOG(USER) << "criu: server did not become quiescent within "
+                      << kQuiesceTimeoutSecs << "s; aborting checkpoint.";
+      checkpoint_thread.join();
+      return blaze_exit_code::INTERNAL_ERROR;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  int code = CriuCheckpoint(startup_options.output_base, install_md5, stop);
+
+  // Release the parked server command. On the stop path the server is already
+  // being torn down, but removing the sentinel is harmless and keeps the dir
+  // clean. On restore the sentinel is instead removed by the init from inside
+  // the namespace (see RunInit), before the resumed command's next tick.
+  blaze_util::UnlinkPath(sentinel);
+  BAZEL_LOG(USER) << "criu: removed checkpoint sentinel "
+                  << sentinel.AsPrintablePath()
+                  << "; releasing parked server command.";
+  checkpoint_thread.join();
+  return code;
+}
+
 static void RunLauncher(const string& self_path,
                         const vector<string>& archive_contents,
                         const string& install_md5,
@@ -1891,12 +1963,13 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
 
   MaybeConfigureCriuMode(startup_options);
 
-  // The `checkpoint` command does not run a bazel command: it asks the
-  // in-namespace init serving this output_base to `criu dump` the running
-  // server, then exits. It is only meaningful when CRIU mode is active
-  // (--criu set); resolving output_base above is all it needs. By
-  // default it tears the server down after the dump; `--leave_running` keeps the
-  // warm server up.
+  // The `checkpoint` command does not run an ordinary bazel command: it first
+  // drives the server-side `checkpoint` command to quiesce the server (take the
+  // command lock, GC, flush logs, park), then asks the in-namespace init serving
+  // this output_base to `criu dump` the quiesced server, then exits. It is only
+  // meaningful when CRIU mode is active (--criu set); resolving output_base
+  // above is all it needs. By default it tears the server down after the dump;
+  // `--leave_running` keeps the warm server up.
   if ("checkpoint" == option_processor->GetCommand()) {
     if (!CriuModeActive()) {
       BAZEL_LOG(USER) << "The 'checkpoint' command requires CRIU mode "
@@ -1915,7 +1988,8 @@ int Main(int argc, const char *const *argv, WorkspaceLayout *workspace_layout,
         return blaze_exit_code::BAD_ARGV;
       }
     }
-    return CriuCheckpoint(startup_options->output_base, install_md5, stop);
+    blaze_server = new BlazeServer(*startup_options, command_extension_adder);
+    return RunCheckpoint(*startup_options, install_md5, stop, blaze_server);
   }
 
   RunLauncher(self_path, archive_contents, install_md5, *startup_options,
@@ -2256,6 +2330,32 @@ void BlazeServer::KillRunningServer() {
     }
     KillServerProcess(process_info_.server_pid_, output_base_);
   }
+}
+
+std::thread BlazeServer::SendCheckpointCommand() {
+  assert(Connected());
+  // Run the command on a background thread: it parks on the server (holding the
+  // exclusive command lock) until the launcher removes the checkpoint sentinel,
+  // so the RPC does not return until then. The gRPC stream is severed by the
+  // criu dump's --tcp-close; a client disconnect does not interrupt the parked
+  // command (see CommandServer.run), so the server stays parked regardless. We
+  // swallow all stream output/status: the sentinel file, not this RPC, is the
+  // real synchronization channel.
+  return std::thread([this]() {
+    grpc::ClientContext context;
+    command_server::RunRequest request;
+    request.set_cookie(request_cookie_);
+    request.set_block_for_lock(true);
+    request.set_client_description("pid=" + blaze::GetProcessIdAsString() +
+                                   " (for checkpoint)");
+    request.add_arg("checkpoint");
+    std::unique_ptr<grpc::ClientReader<command_server::RunResponse>> reader(
+        client_->Run(&context, request));
+    command_server::RunResponse response;
+    while (reader->Read(&response)) {
+    }
+    reader->Finish();
+  });
 }
 
 unsigned int BlazeServer::Communicate(

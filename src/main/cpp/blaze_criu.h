@@ -92,6 +92,13 @@ bool CriuPreflight(std::string *error);
 int CriuCheckpoint(const blaze_util::Path &output_base,
                    const std::string &install_md5, bool stop);
 
+// Path of the checkpoint sentinel file: $output_base/server/checkpoint.sentinel.
+// The server-side `checkpoint` command creates it once it has quiesced (taken
+// the command lock, GC'd, and flushed its logs), and the launcher removes it
+// after taking the checkpoint to release the parked server. Shared with the
+// Java CheckpointCommand, which uses the same basename under the server dir.
+blaze_util::Path CriuCheckpointSentinelPath(const blaze_util::Path &output_base);
+
 // Returns true if a usable CRIU checkpoint exists for output_base AND it was
 // taken by the binary identified by `install_md5` (the install_base basename):
 // the images dir must contain the recorded namespace-local pid that restore

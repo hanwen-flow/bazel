@@ -31,6 +31,7 @@ public class BuiltinCommandModule extends BlazeModule {
     builder.addCommands(
         new BuildCommand(),
         new CanonicalizeCommand(),
+        new CheckpointCommand(),
         new CleanCommand(),
         new CoverageCommand(),
         new DumpCommand(),

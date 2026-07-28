@@ -74,6 +74,15 @@ TEST_F(CriuCheckpointExistsTest, IgnoresSurroundingWhitespaceInKey) {
   EXPECT_TRUE(CriuCheckpointExists(output_base_, "abc123"));
 }
 
+// The sentinel basename and its location under the server dir are a contract
+// shared with the Java CheckpointCommand (SENTINEL_FILE); pin them here so a
+// drift on either side is caught.
+TEST(CriuCheckpointSentinelPathTest, IsCheckpointSentinelUnderServerDir) {
+  const blaze_util::Path output_base("/tmp/ob");
+  EXPECT_EQ(CriuCheckpointSentinelPath(output_base).AsNativePath(),
+            "/tmp/ob/server/checkpoint.sentinel");
+}
+
 // CriuModeActive is false unless SetCriuModeActive(true) was called AND we are
 // on Linux; CriuPreflight is a no-op returning true while the mode is inactive.
 TEST(CriuModeTest, InactiveByDefault) {
